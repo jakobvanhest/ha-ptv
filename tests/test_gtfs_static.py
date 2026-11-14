@@ -302,3 +302,70 @@ def test_checked_today_is_not_asked_again(tmp_path, portal):
     portal.calls.clear()
     run(tmp_path)
     assert portal.calls == []
+
+
+def test_leftover_download_removed(tmp_path, portal):
+    """A download cut off by a restart leaves its temp file; it's cleaned up."""
+    run(tmp_path)
+    leftover = tmp_path / "ptv_gtfs" / "download.zip.tmp"
+    leftover.write_bytes(b"x" * 1024)
+    (tmp_path / "ptv_gtfs" / "tram.zip.tmp").write_bytes(b"x")
+    _age_cache(tmp_path)
+    gs.download_and_cache_gtfs(str(tmp_path), ["Ivanhoe"], ROUTES, "train", False)
+    assert not list((tmp_path / "ptv_gtfs").glob("*.tmp"))
+
+
+def test_leftovers_kept_while_a_download_runs(tmp_path, portal):
+    run(tmp_path)
+    in_progress = tmp_path / "ptv_gtfs" / "download.zip.tmp"
+    in_progress.write_bytes(b"x")
+    with gs._DOWNLOAD_LOCK:                       # another entry downloading
+        gs._remove_leftovers(str(tmp_path))
+    assert in_progress.exists()
+
+
+def _bad_tram_release(tag):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("2/google_transit.zip", inner_zip(tag, "aus:vic:vic-02-HBE:"))
+        broken = io.BytesIO()
+        with zipfile.ZipFile(broken, "w") as b:
+            b.writestr("routes.txt", "route_id\naus:vic:vic-03-109:\n")  # no stop_times
+        z.writestr("3/google_transit.zip", broken.getvalue())
+    return buf.getvalue()
+
+
+def test_one_mode_failing_does_not_mark_its_old_timetable_current(tmp_path, portal):
+    run(tmp_path)                                  # release "a" for both modes
+    _age_cache(tmp_path)
+    portal.publish("2", "https://x/res-b/gtfs.zip")
+    portal.files[portal.url] = _bad_tram_release("2")
+    c = run(tmp_path)
+    assert deps(c) == ["08:02:00"]                 # train moved on
+    versions = json.loads((tmp_path / "ptv_gtfs" / "release.json").read_text())["modes"]
+    assert versions["train"]["url"] == "https://x/res-b/gtfs.zip"
+    assert versions["tram"]["url"] == "https://x/res-a/gtfs.zip"   # still the old one
+    # The tram entry sees its timetable is out of date and tries again.
+    portal.calls.clear()
+    gs.download_and_cache_gtfs(str(tmp_path), [], {"aus:vic:vic-03-109:"}, "tram")
+    assert portal.downloads() == ["https://x/res-b/gtfs.zip"]
+
+
+def test_tram_failing_is_reported_to_the_tram_entry(tmp_path, portal):
+    run(tmp_path)
+    portal.publish("2", "https://x/res-b/gtfs.zip")
+    portal.files[portal.url] = _bad_tram_release("2")
+    c = gs.download_and_cache_gtfs(str(tmp_path), [], {"aus:vic:vic-03-109:"}, "tram")
+    assert "tram timetable unusable" in c["timetable_error"]
+    assert (tmp_path / "ptv_gtfs" / "tram.zip").exists()           # old one kept
+
+
+def test_old_release_file_layout_still_read(tmp_path, portal):
+    run(tmp_path)
+    store = tmp_path / "ptv_gtfs"
+    current = json.loads((store / "release.json").read_text())["modes"]["train"]
+    (store / "release.json").write_text(json.dumps({**current, "modes": ["train", "tram"]}))
+    _age_cache(tmp_path)
+    portal.calls.clear()
+    run(tmp_path)
+    assert portal.downloads() == []                # recognised as current

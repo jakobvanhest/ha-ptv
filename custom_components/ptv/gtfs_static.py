@@ -368,16 +368,45 @@ def _write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
-def _download_release(url: str, config_dir: str, required_mode: str) -> None:
+def _remove_leftovers(config_dir: str) -> None:
+    """Delete temporary files a download interrupted mid-way left behind.
+
+    A restart or power cut during a download skips its own clean-up, which
+    could leave up to ~300 MB on disk until the next release. Only runs when
+    no download is under way (the lock is free), so it never deletes the
+    files of one in progress.
+    """
+    store = _store_dir(config_dir)
+    if not store.is_dir() or not _DOWNLOAD_LOCK.acquire(blocking=False):
+        return
+    try:
+        for leftover in store.glob("*.tmp"):
+            try:
+                size = leftover.stat().st_size
+                leftover.unlink()
+                _LOGGER.info("Removed leftover %s (%d KB)", leftover.name, size // 1024)
+            except OSError as err:
+                _LOGGER.warning("Could not remove leftover %s: %s", leftover.name, err)
+    finally:
+        _DOWNLOAD_LOCK.release()
+
+
+def _download_release(url: str, config_dir: str) -> tuple[set[str], dict[str, str]]:
     """Download a release and keep each mode's inner timetable on disk.
 
-    Streams to a temporary file rather than holding ~240 MB in memory, and
-    keeps every mode so a tram entry reuses a train entry's download. Only
-    `required_mode` must be present; the files are swapped in atomically.
+    Streams to a temporary file rather than holding ~300 MB in memory, and
+    keeps every mode so a tram entry reuses a train entry's download. Each
+    mode's timetable is checked (its checksum while unpacking, then that it
+    opens and has stop times) and only then swapped in, atomically, over the
+    previous one. Returns (modes replaced, {mode: why it wasn't}); the
+    caller records each mode's version separately, so one mode failing
+    never marks the other's old timetable as current.
     """
     store = _store_dir(config_dir)
     store.mkdir(parents=True, exist_ok=True)
     tmp = store / "download.zip.tmp"
+    replaced: set[str] = set()
+    failed: dict[str, str] = {}
     _LOGGER.info("Downloading GTFS timetable from %s", url)
     try:
         with requests.get(
@@ -394,22 +423,37 @@ def _download_release(url: str, config_dir: str, required_mode: str) -> None:
 
         with zipfile.ZipFile(tmp) as outer:
             for mode in MODES:
+                part = store / f"{mode}.zip.tmp"
                 try:
                     entry = _find_mode_entry(outer, mode)
-                    part = store / f"{mode}.zip.tmp"
                     with outer.open(entry) as src, open(part, "wb") as dst:
                         shutil.copyfileobj(src, dst, 1 << 20)
                     with zipfile.ZipFile(part) as check:
                         if "stop_times.txt" not in check.namelist():
                             raise RuntimeError(f"{entry} has no stop_times.txt")
                     os.replace(part, _mode_zip_path(config_dir, mode))
+                    replaced.add(mode)
                 except Exception as err:
-                    (store / f"{mode}.zip.tmp").unlink(missing_ok=True)
-                    if mode == required_mode:
-                        raise
-                    _LOGGER.warning("Skipped %s timetable: %s", mode, err)
+                    part.unlink(missing_ok=True)
+                    failed[mode] = str(err) or type(err).__name__
+                    _LOGGER.warning("Kept the previous %s timetable: %s", mode, failed[mode])
     finally:
         tmp.unlink(missing_ok=True)
+    return replaced, failed
+
+
+def _mode_versions(on_disk: dict) -> dict[str, dict]:
+    """{mode: release info} from release.json, reading the old layout too.
+
+    The first layout had one version for all modes plus a list of modes;
+    each mode now records its own, as they can be replaced separately.
+    """
+    modes = on_disk.get("modes", {})
+    if isinstance(modes, list):
+        shared = {k: on_disk.get(k, "") for k in
+                  ("version", "url", "resource_id", "last_modified", "downloaded_at")}
+        return {m: dict(shared) for m in modes}
+    return dict(modes)
 
 
 def _service_end(z: zipfile.ZipFile) -> str:
@@ -492,33 +536,37 @@ def download_and_cache_gtfs(
             _LOGGER.warning("%s", check_error)
 
     download_error = ""
+    _remove_leftovers(config_dir)
     with _DOWNLOAD_LOCK:
-        on_disk = _read_json(release_path) or {}
-        have_zip = zip_path.exists() and mode in on_disk.get("modes", [])
+        versions = _mode_versions(_read_json(release_path) or {})
+        have_zip = zip_path.exists() and mode in versions
         target = release or (
             None if have_zip or not check_release
             else {"url": GTFS_FALLBACK_URL, "version": ""})
-        if target and (not have_zip or target["version"] != on_disk.get("version")):
+        if target and (not have_zip or target["version"] != versions[mode].get("version")):
             try:
-                _download_release(target["url"], config_dir, mode)
-                on_disk = {
-                    "version": target["version"],
-                    "url": target["url"],
-                    "resource_id": target.get("resource_id", ""),
-                    "last_modified": target.get("last_modified", ""),
-                    "downloaded_at": now_utc,
-                    "modes": [m for m in MODES if _mode_zip_path(config_dir, m).exists()],
-                }
-                _write_json(release_path, on_disk)
-                have_zip = True
+                replaced, failed = _download_release(target["url"], config_dir)
+                for m in replaced:
+                    versions[m] = {
+                        "version": target["version"],
+                        "url": target["url"],
+                        "resource_id": target.get("resource_id", ""),
+                        "last_modified": target.get("last_modified", ""),
+                        "downloaded_at": now_utc,
+                    }
+                if replaced:
+                    _write_json(release_path, {"modes": versions})
+                if mode in failed:
+                    raise RuntimeError(f"{mode} timetable unusable: {failed[mode]}")
             except Exception as err:
                 download_error = f"Timetable download failed: {err}"
                 _LOGGER.warning("%s", download_error)
-                # A failed swap can't leave a half-written zip (os.replace is
-                # atomic), so whatever is on disk is still a whole timetable.
-                have_zip = zip_path.exists() and mode in on_disk.get("modes", [])
+            # A failed swap can't leave a half-written zip (os.replace is
+            # atomic), so whatever is on disk is still a whole timetable.
+            have_zip = zip_path.exists() and mode in versions
         elif release:
             _LOGGER.debug("Timetable on disk is current (%s)", release["last_modified"])
+    on_disk = versions.get(mode, {})
 
     error = download_error or check_error
     if not have_zip:
