@@ -12,17 +12,38 @@ API_VEHICLE_POSITIONS_PATH = "/vehicle-positions"
 API_HEADER_KEY = "KeyID"
 
 # GTFS Static
-GTFS_STATIC_URL = (
+# Transport Victoria republishes the timetable weekly, and the download link
+# (its resource ID) changes from time to time, so the current link is looked
+# up from the open data portal's catalogue (CKAN) before each download.
+GTFS_PACKAGE_API = (
+    "https://opendata.transport.vic.gov.au/api/3/action/package_show"
+    "?id=gtfs-schedule"
+)
+GTFS_API_TIMEOUT = 30
+# Last known link, used only when the catalogue lookup fails and there is no
+# timetable on disk yet. Confirmed 2026-11-15.
+GTFS_FALLBACK_URL = (
     "https://opendata.transport.vic.gov.au/dataset/"
     "3f4e292e-7f8a-4ffe-831f-1953be0fe448/resource/"
-    "fb152201-859f-4882-9206-b768060b50ad/download/gtfs.zip"
+    "62370a3a-3fe0-4f6b-9022-9ebbf25751cc/download/gtfs.zip"
 )
+# Kept for the diagnose tools and anything importing the old name.
+GTFS_STATIC_URL = GTFS_FALLBACK_URL
+GTFS_USER_AGENT = "Mozilla/5.0 (compatible; HomeAssistant/PTV)"
 GTFS_CACHE_FILE = "ptv_gtfs_cache.json"
-GTFS_CACHE_TTL_DAYS = 3
+# Each mode's timetable (the inner google_transit.zip, a few MB) is kept here
+# so a new day's departures can be built without downloading ~240 MB again.
+GTFS_STORE_DIR = "ptv_gtfs"
+GTFS_RELEASE_FILE = "release.json"
 # Bump when cached content changes meaning, so old caches are rebuilt.
 # 2: Metro Tunnel through-running departures.
-GTFS_CACHE_SCHEMA = 2
-GTFS_DOWNLOAD_TIMEOUT = 420
+# 3: release metadata; timetable stored on disk.
+GTFS_CACHE_SCHEMA = 3
+# (connect, read) — read is per chunk while streaming, not the whole download.
+GTFS_DOWNLOAD_TIMEOUT = (30, 120)
+# Raise a repair issue when no new timetable has been confirmed for this long.
+# Releases are weekly, so this allows one missed week.
+GTFS_STALE_DAYS = 10
 GTFS_METRO_INNER_ZIP = "2/google_transit.zip"
 GTFS_TRAM_INNER_ZIP = "3/google_transit.zip"
 

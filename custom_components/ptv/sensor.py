@@ -425,6 +425,10 @@ class PTVUpcomingTrainSensor(CoordinatorEntity, SensorEntity):
             "is_express": entry.get("is_express", False),
             "source": "realtime" if is_rt else "scheduled",
             "formatted": _fmt(entry["dt_iso"], delay_sec, is_rt, entry.get("is_express", False)),
+            # When the scheduled times' timetable was published, to spot a stale one.
+            "timetable_published": (
+                (getattr(self.coordinator, "gtfs_cache", {}) or {}).get("release") or {}
+            ).get("last_modified", "")[:10],
         }
 
     @property

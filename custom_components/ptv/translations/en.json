@@ -67,5 +67,11 @@
     "error": {
       "empty_peak_window": "A peak window's start and end cannot be the same time."
     }
+  },
+  "issues": {
+    "timetable_stale": {
+      "title": "PTV timetable out of date ({title})",
+      "description": "The scheduled departures for {title} could not be updated: {reason}\n\nRealtime departures still work, but times beyond what the live feed covers are not shown until a current timetable is loaded. The integration retries automatically; this notice clears once it succeeds. If it persists, check the Home Assistant log for `custom_components.ptv` and report it on the integration's issue tracker."
+    }
   }
 }

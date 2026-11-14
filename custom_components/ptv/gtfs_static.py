@@ -5,6 +5,9 @@ import csv
 import io
 import json
 import logging
+import os
+import shutil
+import threading
 import zipfile
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -13,13 +16,16 @@ from pathlib import Path
 import requests
 
 from .const import (
+    GTFS_API_TIMEOUT,
     GTFS_CACHE_FILE,
     GTFS_CACHE_SCHEMA,
-    GTFS_CACHE_TTL_DAYS,
     GTFS_DOWNLOAD_TIMEOUT,
-    GTFS_METRO_INNER_ZIP,
-    GTFS_STATIC_URL,
-    METRO_LINES,
+    GTFS_FALLBACK_URL,
+    GTFS_PACKAGE_API,
+    GTFS_RELEASE_FILE,
+    GTFS_STORE_DIR,
+    GTFS_USER_AGENT,
+    MODES,
     MODE_TRAIN,
     MODE_TRAM,
     TUNNEL_SIDES,
@@ -29,38 +35,41 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Train and tram entries share one download; serialise them so the second
+# sees the first's result instead of downloading the same release again.
+_DOWNLOAD_LOCK = threading.Lock()
+
 _METRO_CODES = {
     "ALM","BEG","CBE","CGB","FKN","GWY","HBE",
     "LIL","MDD","PKM","SHM","STY","SUY","UFD","WER","WIL",
 }
 
 
-def _open_mode_zip(outer: zipfile.ZipFile, mode: str = MODE_TRAIN) -> zipfile.ZipFile:
-    """Open the inner GTFS zip for a transport mode."""
+def _find_mode_entry(outer: zipfile.ZipFile, mode: str = MODE_TRAIN) -> str:
+    """Name of the inner GTFS zip for a transport mode within the release."""
     info = mode_info(mode)
     known = info["gtfs_inner_zip"]
     # Route IDs are "aus:vic:vic-02-..." for train, "vic-03-" for tram
     marker = f"vic-{known.split('/')[0].zfill(2)}-"
 
     if known in outer.namelist():
-        try:
-            return zipfile.ZipFile(io.BytesIO(outer.read(known)))
-        except Exception as err:
-            _LOGGER.warning("Known %s zip path failed: %s, scanning...", mode, err)
+        return known
+    _LOGGER.warning("Known %s zip path %s missing, scanning...", mode, known)
     for entry in sorted(outer.namelist()):
         if not entry.endswith("google_transit.zip"):
             continue
         try:
-            inner_z = zipfile.ZipFile(io.BytesIO(outer.read(entry)))
+            with outer.open(entry) as raw:
+                inner_z = zipfile.ZipFile(io.BytesIO(raw.read()))
             if "routes.txt" not in inner_z.namelist():
                 continue
             with inner_z.open("routes.txt") as f:
                 content = f.read().decode("utf-8-sig")
             if mode == MODE_TRAIN:
                 if len([c for c in _METRO_CODES if f"-{c}:" in content]) >= 3:
-                    return inner_z
+                    return entry
             elif marker in content:
-                return inner_z
+                return entry
         except Exception:
             pass
     raise RuntimeError(f"Could not locate {mode} data inside GTFS zip.")
@@ -256,90 +265,260 @@ def _load_scheduled_departures(
     return deps
 
 
+# ---------------------------------------------------------------------- #
+# Finding and downloading the current release
+# ---------------------------------------------------------------------- #
+
+def resolve_gtfs_release() -> dict:
+    """Look up the current timetable release on the open data portal.
+
+    Returns {"url", "resource_id", "last_modified", "size", "version"}.
+    The resource ID is not stable (it changed on 2026-11-02, which left the
+    old hardcoded link returning 404), and a weekly update can also replace
+    the file under the same ID, so the version covers all three.
+    """
+    resp = requests.get(
+        GTFS_PACKAGE_API,
+        timeout=GTFS_API_TIMEOUT,
+        headers={"User-Agent": GTFS_USER_AGENT},
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if not body.get("success"):
+        raise RuntimeError(f"catalogue lookup unsuccessful: {body.get('error')}")
+    resources = [
+        r for r in (body.get("result") or {}).get("resources", [])
+        if r.get("url")
+        and r.get("state", "active") == "active"
+        and (str(r.get("format", "")).upper() == "ZIP"
+             or r["url"].lower().endswith(".zip"))
+    ]
+    if not resources:
+        raise RuntimeError("catalogue lists no GTFS zip")
+    newest = max(
+        resources, key=lambda r: r.get("last_modified") or r.get("created") or "")
+    modified = newest.get("last_modified") or newest.get("created") or ""
+    return {
+        "url": newest["url"],
+        "resource_id": newest.get("id", ""),
+        "last_modified": modified,
+        "size": newest.get("size"),
+        "version": f"{newest.get('id', '')}|{modified}|{newest.get('size')}",
+    }
+
+
+def _store_dir(config_dir: str) -> Path:
+    return Path(config_dir) / GTFS_STORE_DIR
+
+
+def _mode_zip_path(config_dir: str, mode: str) -> Path:
+    return _store_dir(config_dir) / f"{mode}.zip"
+
+
+def _read_json(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as err:
+        _LOGGER.warning("Could not read %s: %s", path.name, err)
+        return None
+
+
+def _write_json(path: Path, data: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def _download_release(url: str, config_dir: str, required_mode: str) -> None:
+    """Download a release and keep each mode's inner timetable on disk.
+
+    Streams to a temporary file rather than holding ~240 MB in memory, and
+    keeps every mode so a tram entry reuses a train entry's download. Only
+    `required_mode` must be present; the files are swapped in atomically.
+    """
+    store = _store_dir(config_dir)
+    store.mkdir(parents=True, exist_ok=True)
+    tmp = store / "download.zip.tmp"
+    _LOGGER.info("Downloading GTFS timetable from %s", url)
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=GTFS_DOWNLOAD_TIMEOUT,
+            headers={"User-Agent": GTFS_USER_AGENT},
+        ) as resp:
+            resp.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    f.write(chunk)
+        _LOGGER.info("Downloaded %d KB", tmp.stat().st_size // 1024)
+
+        with zipfile.ZipFile(tmp) as outer:
+            for mode in MODES:
+                try:
+                    entry = _find_mode_entry(outer, mode)
+                    part = store / f"{mode}.zip.tmp"
+                    with outer.open(entry) as src, open(part, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1 << 20)
+                    with zipfile.ZipFile(part) as check:
+                        if "stop_times.txt" not in check.namelist():
+                            raise RuntimeError(f"{entry} has no stop_times.txt")
+                    os.replace(part, _mode_zip_path(config_dir, mode))
+                except Exception as err:
+                    (store / f"{mode}.zip.tmp").unlink(missing_ok=True)
+                    if mode == required_mode:
+                        raise
+                    _LOGGER.warning("Skipped %s timetable: %s", mode, err)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _service_end(z: zipfile.ZipFile) -> str:
+    """Last date (YYYYMMDD) the timetable has any services for."""
+    end = ""
+    with z.open("calendar.txt") as f:
+        for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+            end = max(end, row.get("end_date", ""))
+    with z.open("calendar_dates.txt") as f:
+        for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+            if row.get("exception_type") == "1":
+                end = max(end, row.get("date", ""))
+    return end
+
+
+def _without_departures(cache: dict, error: str) -> dict:
+    """An old cache stripped of anything tied to the day it was built.
+
+    Its stop list still resolves stations, but its departures belong to
+    another day (a Monday timetable on a Sunday, say), so showing them would
+    be worse than showing realtime departures alone.
+    """
+    out = dict(cache)
+    out["scheduled_by_station"] = {k: [] for k in cache.get("scheduled_by_station", {})}
+    out["through_trips"] = {}
+    out["timetable_error"] = error
+    return out
+
+
+# ---------------------------------------------------------------------- #
+# Building the day's cache
+# ---------------------------------------------------------------------- #
+
 def download_and_cache_gtfs(
     config_dir: str,
     station_names: list[str],
     route_ids: set[str],
     mode: str = MODE_TRAIN,
 ) -> dict:
-    """Download GTFS static data, cache it, return cache dict."""
+    """Return today's timetable cache, downloading a new release if needed.
+
+    Once a day (the first call on a new date) this asks the portal for the
+    current release, downloads it only if it differs from the one on disk,
+    and rebuilds today's departures from the timetable on disk. Failures
+    fall back to the timetable already on disk, which stays correct for
+    any date it covers; failing that, to an old cache without departures.
+    """
     # Train and tram are separate config entries, so they need separate caches.
     cache_name = GTFS_CACHE_FILE if mode == MODE_TRAIN else \
         GTFS_CACHE_FILE.replace(".json", f"_{mode}.json")
     cache_path = Path(config_dir) / cache_name
-    today_str = datetime.now().astimezone().strftime("%Y%m%d")
+    now = datetime.now().astimezone()
+    today_str = now.strftime("%Y%m%d")
+    now_utc = datetime.now(timezone.utc).isoformat()
 
-    stale_cache: dict | None = None
+    old = _read_json(cache_path)
+    if (old and old.get("schema") == GTFS_CACHE_SCHEMA
+            and old.get("cached_date") == today_str
+            and old.get("release_check_ok")
+            and all(s.lower() in old.get("scheduled_by_station", {}) for s in station_names)):
+        _LOGGER.debug("Using today's GTFS cache")
+        return old
+    old = old or {}
 
-    if cache_path.exists():
-        try:
-            with open(cache_path) as f:
-                cache = json.load(f)
-            cached_at = datetime.fromisoformat(cache.get("cached_at","2000-01-01"))
-            age_days = (datetime.now(timezone.utc) - cached_at.replace(tzinfo=timezone.utc)).days
-            # Return immediately if cache is fresh and covers all stations
-            if (age_days < GTFS_CACHE_TTL_DAYS and cache.get("cached_date") == today_str
-                    and cache.get("schema") == GTFS_CACHE_SCHEMA):
-                cached_stations = set(cache.get("scheduled_by_station", {}).keys())
-                if all(s.lower() in cached_stations for s in station_names):
-                    _LOGGER.debug("Using cached GTFS data (age %d days)", age_days)
-                    return cache
-            # Keep stale cache as a fallback in case the download fails
-            stale_cache = cache
-        except Exception as err:
-            _LOGGER.warning("Could not read GTFS cache: %s", err)
+    release_path = _store_dir(config_dir) / GTFS_RELEASE_FILE
+    zip_path = _mode_zip_path(config_dir, mode)
 
-    _LOGGER.info("Downloading GTFS static schedule...")
+    release: dict | None = None
+    check_error = ""
     try:
-        resp = requests.get(
-            GTFS_STATIC_URL,
-            # ~280 MB; 180s needs a sustained 12 Mbit/s, which times out on
-            # slower connections and leaves setup with no station list.
-            timeout=GTFS_DOWNLOAD_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; HomeAssistant/PTV)"},
-        )
-        resp.raise_for_status()
+        release = resolve_gtfs_release()
     except Exception as err:
-        if stale_cache:
-            _LOGGER.warning(
-                "GTFS download failed (%s) — using stale cache from %s as fallback",
-                err, stale_cache.get("cached_date","unknown"),
-            )
-            return stale_cache
-        raise
-    _LOGGER.info("Downloaded %d KB", len(resp.content)//1024)
+        check_error = f"Could not look up the current timetable: {err}"
+        _LOGGER.warning("%s", check_error)
 
-    outer = zipfile.ZipFile(io.BytesIO(resp.content))
-    metro_z = _open_mode_zip(outer, mode)
-    stops = _load_stops(metro_z, mode)
-    direction_labels = _load_direction_labels(metro_z, route_ids)
+    download_error = ""
+    with _DOWNLOAD_LOCK:
+        on_disk = _read_json(release_path) or {}
+        have_zip = zip_path.exists() and mode in on_disk.get("modes", [])
+        target = release or (None if have_zip else {"url": GTFS_FALLBACK_URL, "version": ""})
+        if target and (not have_zip or target["version"] != on_disk.get("version")):
+            try:
+                _download_release(target["url"], config_dir, mode)
+                on_disk = {
+                    "version": target["version"],
+                    "url": target["url"],
+                    "resource_id": target.get("resource_id", ""),
+                    "last_modified": target.get("last_modified", ""),
+                    "downloaded_at": now_utc,
+                    "modes": [m for m in MODES if _mode_zip_path(config_dir, m).exists()],
+                }
+                _write_json(release_path, on_disk)
+                have_zip = True
+            except Exception as err:
+                download_error = f"Timetable download failed: {err}"
+                _LOGGER.warning("%s", download_error)
+                # A failed swap can't leave a half-written zip (os.replace is
+                # atomic), so whatever is on disk is still a whole timetable.
+                have_zip = zip_path.exists() and mode in on_disk.get("modes", [])
+        elif release:
+            _LOGGER.debug("Timetable on disk is current (%s)", release["last_modified"])
 
-    dow = datetime.now().astimezone().strftime("%A").lower()
-    through_trips = _through_trips(
-        metro_z, route_ids, _active_service_ids(metro_z, today_str, dow))
+    error = download_error or check_error
+    if not have_zip:
+        if old.get("stops"):
+            _LOGGER.warning("No timetable on disk; scheduled departures unavailable")
+            return _without_departures(old, error)
+        raise RuntimeError(error or "No GTFS timetable available")
 
-    # Load scheduled departures for each requested station
-    scheduled_by_station: dict[str, list] = {}
-    for station_name in station_names:
-        key = station_name.lower()
-        entry = stops.get(key)
-        if not entry:
-            for k, v in stops.items():
-                if key in k:
-                    entry = v
-                    break
-        if entry:
-            stop_ids = set(entry["stop_ids"])
-            deps = _load_scheduled_departures(
-                metro_z, stop_ids, route_ids, today_str, dow, through_trips)
-            scheduled_by_station[key] = deps
-            _LOGGER.info("Loaded %d departures for %s", len(deps), station_name)
-        else:
-            _LOGGER.warning("Station '%s' not found in GTFS static data", station_name)
-            scheduled_by_station[key] = []
+    with zipfile.ZipFile(zip_path) as metro_z:
+        stops = _load_stops(metro_z, mode)
+        direction_labels = _load_direction_labels(metro_z, route_ids)
+        service_end = _service_end(metro_z)
+
+        dow = now.strftime("%A").lower()
+        active_sids = _active_service_ids(metro_z, today_str, dow)
+        through_trips = _through_trips(metro_z, route_ids, active_sids)
+
+        # Load scheduled departures for each requested station
+        scheduled_by_station: dict[str, list] = {}
+        for station_name in station_names:
+            key = station_name.lower()
+            entry = stops.get(key)
+            if not entry:
+                for k, v in stops.items():
+                    if key in k:
+                        entry = v
+                        break
+            if entry:
+                stop_ids = set(entry["stop_ids"])
+                deps = _load_scheduled_departures(
+                    metro_z, stop_ids, route_ids, today_str, dow, through_trips)
+                scheduled_by_station[key] = deps
+                _LOGGER.info("Loaded %d departures for %s", len(deps), station_name)
+            else:
+                _LOGGER.warning("Station '%s' not found in GTFS static data", station_name)
+                scheduled_by_station[key] = []
+
+    if not active_sids:
+        error = error or f"The timetable has no services for {today_str} (it runs to {service_end})"
+        _LOGGER.warning("%s", error)
 
     cache = {
-        "cached_at": datetime.now(timezone.utc).isoformat(),
+        "cached_at": now_utc,
         "cached_date": today_str,
         "schema": GTFS_CACHE_SCHEMA,
         "mode": mode,
@@ -347,11 +526,17 @@ def download_and_cache_gtfs(
         "direction_labels": direction_labels,
         "through_trips": through_trips,
         "scheduled_by_station": scheduled_by_station,
+        # Release bookkeeping, for the staleness repair issue.
+        "release": on_disk,
+        "release_check_ok": release is not None,
+        "release_checked_at": now_utc if release else old.get("release_checked_at", ""),
+        "service_end": service_end,
+        "has_service_today": bool(active_sids),
+        "timetable_error": error,
     }
 
     try:
-        with open(cache_path, "w") as f:
-            json.dump(cache, f)
+        _write_json(cache_path, cache)
         _LOGGER.info("GTFS cache saved")
     except Exception as err:
         _LOGGER.warning("Could not save GTFS cache: %s", err)

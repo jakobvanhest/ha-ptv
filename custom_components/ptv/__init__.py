@@ -9,6 +9,7 @@ from google.transit import gtfs_realtime_pb2
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -28,7 +29,7 @@ from .const import (
     DIR_CITYBOUND, DIR_OUTBOUND, DIR_BOTH,
     CONF_MODE, DEFAULT_MODE, MODE_TRAIN, api_base_for_mode, mode_info, routes_for_mode,
     line_phrase, TUNNEL_SIDES,
-    DOMAIN, KNOWN_STOP_IDS, METRO_LINES, OCCUPANCY_LABELS,
+    DOMAIN, GTFS_STALE_DAYS, KNOWN_STOP_IDS, METRO_LINES, OCCUPANCY_LABELS,
     PROBLEM_NONE, PROBLEM_DELAYS, PROBLEM_ALERT, PROBLEM_CANCELLATIONS, PROBLEM_MAJOR,
 )
 from .gtfs_static import download_and_cache_gtfs, get_next_n_scheduled, get_stop_ids
@@ -48,6 +49,48 @@ END_OF_SERVICE_HOUR = 4
 FEED_MAX_STALE = timedelta(minutes=15)
 # Wait between attempts when the daily timetable refresh fails.
 GTFS_REFRESH_RETRY = timedelta(hours=1)
+
+
+def _timetable_problem(cache: dict, now: datetime) -> str:
+    """Why the timetable can't be trusted, or "" when it is fine."""
+    if not cache:
+        return "No timetable has been downloaded yet."
+    if cache.get("cached_date") != now.strftime("%Y%m%d"):
+        return cache.get("timetable_error") or "Today's timetable could not be loaded."
+    if not cache.get("has_service_today", True):
+        return cache.get("timetable_error") or "The timetable has no services for today."
+    confirmed = (cache.get("release_checked_at")
+                 or (cache.get("release") or {}).get("downloaded_at"))
+    if not confirmed:
+        return cache.get("timetable_error") or "The timetable version has never been confirmed."
+    age = now - datetime.fromisoformat(confirmed)
+    if age > timedelta(days=GTFS_STALE_DAYS):
+        return (f"No new timetable has been confirmed for {age.days} days. "
+                f"{cache.get('timetable_error', '')}").strip()
+    return ""
+
+
+def _issue_id(entry_id: str) -> str:
+    return f"timetable_stale_{entry_id}"
+
+
+def update_timetable_issue(hass: HomeAssistant, entry: ConfigEntry, cache: dict) -> None:
+    """Raise or clear the repair issue for an out-of-date timetable.
+
+    Before this, a broken download only logged a warning, and the sensors
+    quietly kept showing an old day's timetable for weeks.
+    """
+    problem = _timetable_problem(cache, datetime.now().astimezone())
+    if not problem:
+        ir.async_delete_issue(hass, DOMAIN, _issue_id(entry.entry_id))
+        return
+    ir.async_create_issue(
+        hass, DOMAIN, _issue_id(entry.entry_id),
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="timetable_stale",
+        translation_placeholders={"title": entry.title, "reason": problem},
+    )
 
 
 def _overnight_window(alert_text: str, start_ts: int, end_ts: int) -> str | None:
@@ -147,21 +190,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 route_ids,
                 mode,
             )
-            # Fill in stop IDs for any stations not hardcoded
-            for name in station_names:
-                key = name.lower()
-                if key not in station_stop_ids:
-                    ids = get_stop_ids(gtfs_cache, name)
-                    if ids:
-                        station_stop_ids[key] = {"stop_ids": ids}
-                        _LOGGER.info("Resolved '%s' stop_ids from GTFS: %s", name, ids)
-                    else:
-                        _LOGGER.warning("Could not resolve stop_ids for '%s'", name)
+            _resolve_stop_ids(gtfs_cache, station_names, station_stop_ids)
         except Exception as err:
             _LOGGER.warning("GTFS static load failed: %s", err)
 
     coordinator = PTVDataCoordinator(
         hass,
+        entry=entry,
         api_key=api_key,
         monitored_lines=monitored_lines,
         scan_interval=scan_interval,
@@ -173,6 +208,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         mode=mode,
     )
 
+    if station_names:
+        update_timetable_issue(hass, entry, gtfs_cache)
+        now = datetime.now().astimezone()
+        if gtfs_cache.get("cached_date") != now.strftime("%Y%m%d"):
+            # Setup just tried; don't try again on the first poll.
+            coordinator._gtfs_retry_after = now + GTFS_REFRESH_RETRY
     await coordinator.async_config_entry_first_refresh()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
@@ -187,11 +228,30 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return unload_ok
 
 
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    ir.async_delete_issue(hass, DOMAIN, _issue_id(entry.entry_id))
+
+
+def _resolve_stop_ids(cache: dict, station_names: list[str], station_stop_ids: dict) -> None:
+    """Fill in stop IDs from the timetable for stations not hardcoded."""
+    for name in station_names:
+        key = name.lower()
+        if key in station_stop_ids:
+            continue
+        ids = get_stop_ids(cache, name)
+        if ids:
+            station_stop_ids[key] = {"stop_ids": ids}
+            _LOGGER.info("Resolved '%s' stop_ids from GTFS: %s", name, ids)
+        else:
+            _LOGGER.warning("Could not resolve stop_ids for '%s'", name)
+
+
 class PTVDataCoordinator(DataUpdateCoordinator):
 
     def __init__(self, hass, api_key, monitored_lines, scan_interval,
                  alert_effects, stations_config, station_stop_ids, gtfs_cache,
-                 polling=None, mode=DEFAULT_MODE):
+                 polling=None, mode=DEFAULT_MODE, entry=None):
+        self.entry = entry
         self.api_key = api_key
         self.mode = mode
         self.api_base = api_base_for_mode(mode)
@@ -201,7 +261,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         self.alert_effects = alert_effects        # set of int effect values to include
         self.stations_config = stations_config   # list of {name, directions, count}
         self.station_stop_ids = station_stop_ids  # key -> {stop_ids, citybound_stop_ids, outbound_stop_ids}
-        self.gtfs_cache = gtfs_cache
+        self.gtfs_cache = gtfs_cache or {}
         self._gtfs_retry_after: datetime | None = None
         self.polling = {
             CONF_SCAN_INTERVAL: scan_interval,
@@ -287,8 +347,10 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         It is loaded at setup and holds that day's services only, so without
         this, departures after midnight would keep coming from the day Home
         Assistant started — a weekday timetable on a Saturday, for instance.
+        The first load of each day also checks the portal for a new weekly
+        release and downloads it if there is one.
         """
-        if not self.gtfs_cache or not self.stations_config:
+        if not self.stations_config:
             return
         now = datetime.now().astimezone()
         if self.gtfs_cache.get("cached_date") == now.strftime("%Y%m%d"):
@@ -296,26 +358,35 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         if self._gtfs_retry_after and now < self._gtfs_retry_after:
             return
         routes = routes_for_mode(self.mode)
+        names = [s[CONF_STATION_NAME] for s in self.stations_config]
         try:
             cache = await self.hass.async_add_executor_job(
                 download_and_cache_gtfs,
                 self.hass.config.config_dir,
-                [s[CONF_STATION_NAME] for s in self.stations_config],
+                names,
                 {routes[l] for l in self.monitored_lines if l in routes},
                 self.mode,
             )
         except Exception as err:
-            # Keep yesterday's timetable rather than none, and don't retry the
-            # ~230 MB download on every poll.
+            # Keep what we have, and don't retry the download on every poll.
             _LOGGER.warning("Daily timetable refresh failed: %s", err)
             self._gtfs_retry_after = now + GTFS_REFRESH_RETRY
+            self._update_issue()
             return
         self._gtfs_retry_after = None
         if cache.get("cached_date") != now.strftime("%Y%m%d"):
-            # download_and_cache_gtfs fell back to a stale copy
+            # No timetable for today (departures were dropped rather than
+            # shown from another day); try again in a while.
             self._gtfs_retry_after = now + GTFS_REFRESH_RETRY
         self.gtfs_cache = cache
+        # Stations that couldn't be resolved at setup (no timetable then).
+        _resolve_stop_ids(cache, names, self.station_stop_ids)
+        self._update_issue()
         _LOGGER.info("Timetable refreshed for %s", cache.get("cached_date"))
+
+    def _update_issue(self) -> None:
+        if self.entry is not None:
+            update_timetable_issue(self.hass, self.entry, self.gtfs_cache)
 
     async def _async_update_data(self) -> dict:
         # _schedule_refresh re-reads this after every poll, so retuning here

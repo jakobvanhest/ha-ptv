@@ -13,11 +13,19 @@ except ImportError:
 API_KEY = input("Enter your PTV API key (KeyID): ").strip()
 STATION_NAME = "ivanhoe"
 
-GTFS_STATIC_URL = (
-    "https://opendata.transport.vic.gov.au/dataset/"
-    "3f4e292e-7f8a-4ffe-831f-1953be0fe448/resource/"
-    "fb152201-859f-4882-9206-b768060b50ad/download/gtfs.zip"
-)
+def _current_gtfs_url():
+    """The download link changes over time; ask the portal's catalogue."""
+    r = requests.get(
+        "https://opendata.transport.vic.gov.au/api/3/action/package_show?id=gtfs-schedule",
+        timeout=30,
+    )
+    r.raise_for_status()
+    zips = [x for x in r.json()["result"]["resources"]
+            if str(x.get("format", "")).upper() == "ZIP"]
+    return max(zips, key=lambda x: x.get("last_modified") or x.get("created") or "")["url"]
+
+
+GTFS_STATIC_URL = _current_gtfs_url()
 REALTIME_URL = (
     "https://api.opendata.transport.vic.gov.au"
     "/opendata/public-transport/gtfs/realtime/v1/metro/trip-updates"
