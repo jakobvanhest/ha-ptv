@@ -38,7 +38,8 @@ GTFS_RELEASE_FILE = "release.json"
 # Bump when cached content changes meaning, so old caches are rebuilt.
 # 2: Metro Tunnel through-running departures.
 # 3: release metadata; timetable stored on disk.
-GTFS_CACHE_SCHEMA = 3
+# 4: stop_sequence on scheduled departures, for realtime matching.
+GTFS_CACHE_SCHEMA = 4
 # (connect, read) — read is per chunk while streaming, not the whole download.
 GTFS_DOWNLOAD_TIMEOUT = (30, 120)
 # Raise a repair issue when no new timetable has been confirmed for this long.

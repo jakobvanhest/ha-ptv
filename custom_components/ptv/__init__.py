@@ -482,14 +482,52 @@ class PTVDataCoordinator(DataUpdateCoordinator):
     # Trip updates
     # ------------------------------------------------------------------ #
 
-    def _station_hits(self, stus, direction_id, is_express, now_utc):
+    def _static_index(self) -> dict[str, dict[str, list[dict]]]:
+        """station key -> trip_id -> that trip's scheduled stops there today.
+
+        Built from the timetable, it supplies what the realtime feed may
+        leave out: the trip's direction, the scheduled time (when an update
+        carries only a delay) and the stop_sequence (when an update names a
+        different platform's stop_id). Through-running trips already carry
+        the direction relative to the selected line.
+        """
+        index: dict[str, dict[str, list[dict]]] = {}
+        sched = (self.gtfs_cache or {}).get("scheduled_by_station", {})
+        for scfg in self.stations_config:
+            key = scfg[CONF_STATION_NAME].lower()
+            by_trip: dict[str, list[dict]] = {}
+            for dep in sched.get(key, []):
+                if dep.get("trip_id"):
+                    by_trip.setdefault(dep["trip_id"], []).append(dep)
+            index[key] = by_trip
+        return index
+
+    @staticmethod
+    def _service_midnight(start_date: str) -> datetime:
+        """Local midnight of a trip's service day (GTFS times count from it)."""
+        now = datetime.now().astimezone()
+        if start_date and len(start_date) == 8:
+            try:
+                day = datetime.strptime(start_date, "%Y%m%d")
+                return day.replace(tzinfo=now.tzinfo)
+            except ValueError:
+                pass
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def _station_hits(self, stus, direction_id, is_express, now_utc,
+                      trip_id="", start_date="", index=None, stats=None):
         """First future stop at each configured station for one trip.
 
-        Returns ({station_key: hit or None}, the trip's worst delay).
+        Returns ({station_key: hit, "skipped", or None}, the trip's worst
+        delay). A hit records the direction to file it under: the
+        timetable's when it knows the trip, otherwise the feed's.
         """
-        hits: dict[str, dict | None] = {
+        index = index or {}
+        stats = stats if stats is not None else {}
+        hits: dict[str, dict | str | None] = {
             scfg[CONF_STATION_NAME].lower(): None for scfg in self.stations_config
         }
+        midnight = None
         trip_max_delay = 0
         for stu in stus:
             delay = 0
@@ -503,25 +541,63 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                 if stu.arrival.time:
                     dep_time = datetime.fromtimestamp(stu.arrival.time, tz=timezone.utc)
             trip_max_delay = max(trip_max_delay, delay)
-            if not dep_time or dep_time <= now_utc:
-                continue
             for key in hits:
                 if hits[key] is not None:
                     continue  # already found for this trip
+                scheduled = index.get(key, {}).get(trip_id, [])
+                dir_id = scheduled[0]["direction_id"] if scheduled else direction_id
                 info = self.station_stop_ids.get(key, {})
                 # Use direction-specific stop IDs if available
-                if direction_id == 1:
+                if dir_id == 1:
                     stop_ids = info.get("citybound_stop_ids", info.get("stop_ids", []))
                 else:
                     stop_ids = info.get("outbound_stop_ids", info.get("stop_ids", []))
-                if stu.stop_id in stop_ids:
-                    hits[key] = {"actual": dep_time, "delay_sec": delay, "is_express": is_express}
+                match = None
+                if stu.stop_id and stu.stop_id in stop_ids:
+                    match = "stop_id"
+                    sched = next((d for d in scheduled if d["stop_id"] == stu.stop_id), None) \
+                        or (scheduled[0] if scheduled else None)
+                else:
+                    sched = next(
+                        (d for d in scheduled
+                         if stu.stop_sequence and d.get("stop_sequence") == stu.stop_sequence),
+                        None,
+                    )
+                    if sched:
+                        match = "stop_sequence"
+                if not match:
+                    continue
+                if stu.schedule_relationship == 1:  # SKIPPED: not stopping here
+                    hits[key] = "skipped"
+                    stats["skipped"] = stats.get("skipped", 0) + 1
+                    continue
+                when = dep_time
+                if when is None and sched:
+                    # Delay-only update: scheduled time plus the delay.
+                    if midnight is None:
+                        midnight = self._service_midnight(start_date)
+                    when = midnight + timedelta(seconds=sched["dep_seconds"] + delay)
+                    stats["time_from_delay"] = stats.get("time_from_delay", 0) + 1
+                if when is None:
+                    stats["no_time"] = stats.get("no_time", 0) + 1
+                    continue
+                if when <= now_utc:
+                    continue
+                stats[f"by_{match}"] = stats.get(f"by_{match}", 0) + 1
+                if scheduled and dir_id != direction_id:
+                    stats["direction_from_timetable"] = stats.get("direction_from_timetable", 0) + 1
+                hits[key] = {
+                    "actual": when, "delay_sec": delay, "is_express": is_express,
+                    "dir": dir_id, "trip_id": trip_id,
+                }
         return hits, trip_max_delay
 
     def _parse_trip_updates(self, raw, route_map, results):
         feed = gtfs_realtime_pb2.FeedMessage()
         feed.ParseFromString(raw)
         now_utc = datetime.now(timezone.utc)
+        index = self._static_index()
+        stats: dict[str, int] = {}
 
         # Buckets: line -> station_key -> direction_id -> list of {actual, delay_sec}
         rt_buckets: dict[str, dict[str, dict[int, list]]] = {}
@@ -530,6 +606,12 @@ class PTVDataCoordinator(DataUpdateCoordinator):
             for scfg in self.stations_config:
                 key = scfg[CONF_STATION_NAME].lower()
                 rt_buckets[line][key] = {0: [], 1: []}
+        # Trips the static fallback must not list: cancelled anywhere, or
+        # skipping a given station.
+        self._cancelled_trips: set[str] = set()
+        self._skipped_at: dict[str, set[str]] = {
+            scfg[CONF_STATION_NAME].lower(): set() for scfg in self.stations_config
+        }
 
         # Tunnel trains are split at Town Hall: a Pakenham line's trains carry
         # on as Sunbury trips (and vice versa). Those continuations, linked by
@@ -560,10 +642,12 @@ class PTVDataCoordinator(DataUpdateCoordinator):
 
             # 3=CANCELED, 5=DELETED
             if tu.trip.schedule_relationship in (3, 5):
+                self._cancelled_trips.add(trip_id)
                 if line is not None:
                     results[line]["cancelled_trips"].append(trip_id)
                     results[line]["has_cancellations"] = True
                 continue
+            stats["trips"] = stats.get("trips", 0) + 1
 
             # A citybound tunnel trip ends at the Town Hall handover, where the
             # train continues as another trip; that final stop is an arrival.
@@ -575,10 +659,16 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                 [(l, 1 - direction_id) for l in continuing]
             trip_max_delay = 0
             for tline, tdir in targets:
-                hits, trip_max_delay = self._station_hits(stus, tdir, is_express, now_utc)
+                hits, trip_max_delay = self._station_hits(
+                    stus, tdir, is_express, now_utc,
+                    trip_id=trip_id, start_date=tu.trip.start_date,
+                    index=index, stats=stats,
+                )
                 for key, hit in hits.items():
-                    if hit:
-                        rt_buckets[tline][key][tdir].append(hit)
+                    if hit == "skipped":
+                        self._skipped_at[key].add(trip_id)
+                    elif hit:
+                        rt_buckets[tline][key][hit["dir"]].append(hit)
 
             if line is None:
                 continue
@@ -589,6 +679,10 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                 data["delay_count"] += 1
                 data["max_delay_seconds"] = max(data["max_delay_seconds"], trip_max_delay)
                 data["has_delays"] = True
+
+        # How realtime updates were matched, to diagnose stations that never
+        # show live times (enable debug logging for custom_components.ptv).
+        _LOGGER.debug("Realtime matching: %s", stats or "no trip updates for these lines")
 
         # Sort and store realtime departures per station/direction
         for line in self.monitored_lines:
@@ -603,6 +697,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                             "delay_sec": h["delay_sec"],
                             "is_realtime": True,
                             "is_express": h["is_express"],
+                            "trip_id": h["trip_id"],
                         }
                         for h in hits[:count]
                     ]
@@ -615,6 +710,8 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         if not self.gtfs_cache:
             return
         now_sec = self._secs_since_midnight()
+        cancelled = getattr(self, "_cancelled_trips", set())
+        skipped_at = getattr(self, "_skipped_at", {})
 
         for line in self.monitored_lines:
             for scfg in self.stations_config:
@@ -646,8 +743,11 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                     else:
                         after_sec = now_sec
 
+                    exclude = cancelled | skipped_at.get(key, set()) | {
+                        e.get("trip_id") for e in existing if e.get("trip_id")
+                    }
                     scheduled = get_next_n_scheduled(
-                        self.gtfs_cache, key, dir_id, after_sec, needed
+                        self.gtfs_cache, key, dir_id, after_sec, needed, exclude
                     )
                     for sched in scheduled:
                         dt = self._secs_to_dt(sched["dep_seconds"])
@@ -656,6 +756,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                             "delay_sec": 0,
                             "is_realtime": False,
                             "is_express": False,  # not derivable from static schedule
+                            "trip_id": sched.get("trip_id", ""),
                         })
 
     # ------------------------------------------------------------------ #

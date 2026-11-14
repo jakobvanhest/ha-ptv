@@ -259,6 +259,9 @@ def _load_scheduled_departures(
             "direction_id": trip_dirs[tid],
             "trip_id": tid,
             "stop_id": row["stop_id"],
+            # Lets realtime updates be matched to this stop even when they
+            # name a different platform's stop_id.
+            "stop_sequence": int(row.get("stop_sequence") or 0),
             "dep_str": dep_str,
         })
     deps.sort(key=lambda x: x["dep_seconds"])
@@ -579,12 +582,19 @@ def get_next_n_scheduled(
     direction_id: int,
     after_seconds: int,
     count: int = 4,
+    exclude_trips: set[str] | frozenset = frozenset(),
 ) -> list[dict]:
-    """Return up to `count` scheduled departures in given direction after after_seconds."""
+    """Up to `count` scheduled departures in a direction after after_seconds.
+
+    exclude_trips drops trips the realtime feed says won't stop here
+    (cancelled, or skipping this station).
+    """
     key = station_name.lower()
     all_deps = cache.get("scheduled_by_station", {}).get(key, [])
     results = []
     for dep in all_deps:
+        if dep.get("trip_id") in exclude_trips:
+            continue
         if dep["direction_id"] == direction_id and dep["dep_seconds"] > after_seconds:
             results.append(dep)
             if len(results) >= count:

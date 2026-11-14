@@ -132,6 +132,22 @@ def _direction_label(coordinator, line, direction: str) -> str:
     )
 
 
+def _direction_text(coordinator, line, direction: str) -> str:
+    """Where the train is headed, for the `direction` attribute.
+
+    Citybound reads "Towards City"; outbound takes the line's most common
+    outbound destination from the timetable ("Towards Hurstbridge").
+    This used to be hardcoded to the Hurstbridge line for every line.
+    """
+    if _is_tram(coordinator):
+        return _direction_label(coordinator, line, direction)
+    if direction == DIR_CITYBOUND:
+        return "Towards City"
+    route_id = routes_for_mode(coordinator.mode).get(line, "")
+    dest = get_direction_label(getattr(coordinator, "gtfs_cache", {}) or {}, route_id, 0)
+    return f"Towards {dest}" if dest else "Outbound"
+
+
 def _fmt(iso: str | None, delay_sec: int, is_realtime: bool, is_express: bool = False) -> str:
     if not iso:
         return "Unknown"
@@ -416,7 +432,7 @@ class PTVUpcomingTrainSensor(CoordinatorEntity, SensorEntity):
         is_rt = entry.get("is_realtime", False)
         return {
             "station": self._station,
-            "direction": "Towards City" if self._direction == "citybound" else "Towards Hurstbridge/Eltham",
+            "direction": _direction_text(self.coordinator, self._line, self._direction),
             "index": self._index,
             "delay_seconds": delay_sec,
             "delay_minutes": round(delay_sec / 60, 1),
