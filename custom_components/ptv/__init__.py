@@ -1,6 +1,7 @@
 """PTV - Home Assistant Integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -47,6 +48,10 @@ OVERNIGHT_PHRASES = ("each night", "every night", "each evening")
 END_OF_SERVICE_HOUR = 4
 # How old a feed may be before a failed request fails the update.
 FEED_MAX_STALE = timedelta(minutes=15)
+# Pause before asking an endpoint again after it answers 429 Too Many
+# Requests without a Retry-After header. PTV allows 20-27 calls a minute
+# per endpoint; a normal poll makes one call to each.
+RATE_LIMIT_BACKOFF = timedelta(seconds=90)
 # Wait between attempts when the daily timetable refresh fails.
 GTFS_REFRESH_RETRY = timedelta(hours=1)
 
@@ -74,13 +79,18 @@ def _issue_id(entry_id: str) -> str:
     return f"timetable_stale_{entry_id}"
 
 
-def update_timetable_issue(hass: HomeAssistant, entry: ConfigEntry, cache: dict) -> None:
+def update_timetable_issue(hass: HomeAssistant, entry: ConfigEntry, cache: dict,
+                           pending: bool = False) -> None:
     """Raise or clear the repair issue for an out-of-date timetable.
 
     Before this, a broken download only logged a warning, and the sensors
-    quietly kept showing an old day's timetable for weeks.
+    quietly kept showing an old day's timetable for weeks. With pending (a
+    background load is under way) an existing issue is left as it is and
+    no new one is raised until that load has finished.
     """
     problem = _timetable_problem(cache, datetime.now().astimezone())
+    if problem and pending:
+        return
     if not problem:
         ir.async_delete_issue(hass, DOMAIN, _issue_id(entry.entry_id))
         return
@@ -181,7 +191,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     station_stop_ids[key] = KNOWN_STOP_IDS[key]
                     _LOGGER.info("Using hardcoded stop_ids for '%s'", name)
 
-        # Download GTFS static for timetable + any unknown stations
+        # Timetable for today and any stations not hardcoded, from disk
+        # only: checking the portal (and any ~300 MB download) happens in
+        # the background once setup is done, so startup never waits on it.
         try:
             gtfs_cache = await hass.async_add_executor_job(
                 download_and_cache_gtfs,
@@ -189,10 +201,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 station_names,
                 route_ids,
                 mode,
+                False,
             )
             _resolve_stop_ids(gtfs_cache, station_names, station_stop_ids)
         except Exception as err:
-            _LOGGER.warning("GTFS static load failed: %s", err)
+            _LOGGER.info("No timetable on disk yet (%s); loading it in the background", err)
 
     coordinator = PTVDataCoordinator(
         hass,
@@ -209,11 +222,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     if station_names:
-        update_timetable_issue(hass, entry, gtfs_cache)
-        now = datetime.now().astimezone()
-        if gtfs_cache.get("cached_date") != now.strftime("%Y%m%d"):
-            # Setup just tried; don't try again on the first poll.
-            coordinator._gtfs_retry_after = now + GTFS_REFRESH_RETRY
+        update_timetable_issue(hass, entry, gtfs_cache, pending=True)
     await coordinator.async_config_entry_first_refresh()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
@@ -222,6 +231,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator and coordinator._timetable_task and not coordinator._timetable_task.done():
+        coordinator._timetable_task.cancel()
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id)
@@ -263,6 +275,8 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         self.station_stop_ids = station_stop_ids  # key -> {stop_ids, citybound_stop_ids, outbound_stop_ids}
         self.gtfs_cache = gtfs_cache or {}
         self._gtfs_retry_after: datetime | None = None
+        self._timetable_task: asyncio.Task | None = None
+        self._rate_limited_until: dict[str, datetime] = {}
         self.polling = {
             CONF_SCAN_INTERVAL: scan_interval,
             CONF_OFFPEAK_INTERVAL: DEFAULT_OFFPEAK_INTERVAL,
@@ -299,14 +313,28 @@ class PTVDataCoordinator(DataUpdateCoordinator):
 
         return timedelta(seconds=int(p[CONF_OFFPEAK_INTERVAL]))
 
+    def _cache_midnight(self) -> datetime:
+        """Local midnight of the day the timetable cache was built for.
+
+        Scheduled times count seconds from it, and can run past 86400 for
+        trains after midnight. Between midnight and the day's refresh the
+        cache is still yesterday's, and its times stay correct this way.
+        """
+        now = datetime.now().astimezone()
+        day = (self.gtfs_cache or {}).get("cached_date", "")
+        try:
+            # Midnight is local; build it naively, then let astimezone pick
+            # that date's UTC offset (daylight saving can differ from now's).
+            return datetime.strptime(day, "%Y%m%d").astimezone()
+        except ValueError:
+            return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
     def _secs_since_midnight(self) -> int:
-        n = datetime.now().astimezone()
-        return n.hour * 3600 + n.minute * 60 + n.second
+        """Seconds from the cache day's midnight to now."""
+        return int((datetime.now().astimezone() - self._cache_midnight()).total_seconds())
 
     def _secs_to_dt(self, secs: int) -> datetime:
-        now = datetime.now().astimezone()
-        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return midnight + timedelta(seconds=secs)
+        return self._cache_midnight() + timedelta(seconds=secs)
 
     def _fetch_feed(self, path: str) -> bytes:
         """Fetch a feed, falling back to its last good copy on a blip.
@@ -317,12 +345,24 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         FEED_MAX_STALE old is still accurate enough: the parsers drop
         departures already in the past.
         """
+        now = datetime.now(timezone.utc)
         try:
+            until = self._rate_limited_until.get(path)
+            if until and now < until:
+                # Don't ask again until PTV said to; asking anyway only
+                # extends the block.
+                raise requests.RequestException(f"rate limited until {until:%H:%M:%S}")
             resp = requests.get(
                 f"{self.api_base}{path}",
                 headers={API_HEADER_KEY: self.api_key},
                 timeout=(10, 25),
             )
+            if resp.status_code == 429:
+                self._rate_limited_until[path] = now + self._retry_after(resp)
+                _LOGGER.warning(
+                    "PTV %s answered 429 Too Many Requests; pausing it until %s",
+                    path, self._rate_limited_until[path].astimezone().strftime("%H:%M:%S"),
+                )
             resp.raise_for_status()
         except requests.RequestException as err:
             cached = self._last_feeds.get(path)
@@ -341,22 +381,61 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         self._last_feeds[path] = (resp.content, datetime.now(timezone.utc))
         return resp.content
 
-    async def _async_refresh_timetable(self) -> None:
-        """Reload the static timetable once the day has rolled over.
+    @staticmethod
+    def _retry_after(resp) -> timedelta:
+        """The pause a 429 asks for, capped at 15 minutes."""
+        try:
+            secs = int(resp.headers.get("Retry-After", ""))
+            return timedelta(seconds=max(1, min(secs, 900)))
+        except (TypeError, ValueError):
+            return RATE_LIMIT_BACKOFF
 
-        It is loaded at setup and holds that day's services only, so without
-        this, departures after midnight would keep coming from the day Home
-        Assistant started — a weekday timetable on a Saturday, for instance.
-        The first load of each day also checks the portal for a new weekly
-        release and downloads it if there is one.
+    async def _async_fetch_all_feeds(self) -> tuple[bytes, bytes, bytes]:
+        """The three feeds, fetched at the same time.
+
+        Same calls as before (one per endpoint per poll, no retries), so no
+        extra load against PTV's per-endpoint limits; a slow poll now takes
+        as long as the slowest feed rather than all three added together.
+        """
+        trip, alerts, pos = await asyncio.gather(*(
+            self.hass.async_add_executor_job(self._fetch_feed, path)
+            for path in (API_TRIP_UPDATES_PATH, API_SERVICE_ALERTS_PATH,
+                         API_VEHICLE_POSITIONS_PATH)
+        ))
+        return trip, alerts, pos
+
+    def _schedule_timetable_refresh(self) -> None:
+        """Start the timetable refresh in the background if it is due.
+
+        Due once a day (the first poll after midnight rebuilds the day's
+        departures and checks the portal for a new release), or on the first
+        poll after startup, which loads from disk only. Running it as a
+        task means polls, and Home Assistant's startup, never wait on the
+        portal or a download.
         """
         if not self.stations_config:
             return
+        if self._timetable_task and not self._timetable_task.done():
+            return
         now = datetime.now().astimezone()
-        if self.gtfs_cache.get("cached_date") == now.strftime("%Y%m%d"):
+        today = now.strftime("%Y%m%d")
+        cache = self.gtfs_cache or {}
+        if cache.get("cached_date") == today and cache.get("release_checked_date") == today:
             return
         if self._gtfs_retry_after and now < self._gtfs_retry_after:
             return
+        self._timetable_task = self.hass.async_create_background_task(
+            self._async_refresh_timetable(), name="ptv timetable refresh")
+
+    async def _async_refresh_timetable(self) -> None:
+        """Reload the static timetable and check for a new release.
+
+        It holds one day's services, so without this, departures after
+        midnight would keep coming from the day Home Assistant started — a
+        weekday timetable on a Saturday, for instance. Runs as a background
+        task (see _schedule_timetable_refresh).
+        """
+        now = datetime.now().astimezone()
         routes = routes_for_mode(self.mode)
         names = [s[CONF_STATION_NAME] for s in self.stations_config]
         try:
@@ -369,7 +448,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
             )
         except Exception as err:
             # Keep what we have, and don't retry the download on every poll.
-            _LOGGER.warning("Daily timetable refresh failed: %s", err)
+            _LOGGER.warning("Timetable refresh failed: %s", err)
             self._gtfs_retry_after = now + GTFS_REFRESH_RETRY
             self._update_issue()
             return
@@ -383,6 +462,8 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         _resolve_stop_ids(cache, names, self.station_stop_ids)
         self._update_issue()
         _LOGGER.info("Timetable refreshed for %s", cache.get("cached_date"))
+        # Show the new timetable now rather than at the next poll.
+        await self.async_request_refresh()
 
     def _update_issue(self) -> None:
         if self.entry is not None:
@@ -395,15 +476,9 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         if interval != self.update_interval:
             _LOGGER.debug("Polling interval now %s", interval)
             self.update_interval = interval
-        await self._async_refresh_timetable()
+        self._schedule_timetable_refresh()
         try:
-            trip_raw, alerts_raw, pos_raw = await self.hass.async_add_executor_job(
-                lambda: (
-                    self._fetch_feed(API_TRIP_UPDATES_PATH),
-                    self._fetch_feed(API_SERVICE_ALERTS_PATH),
-                    self._fetch_feed(API_VEHICLE_POSITIONS_PATH),
-                )
-            )
+            trip_raw, alerts_raw, pos_raw = await self._async_fetch_all_feeds()
             return self._parse_all(trip_raw, alerts_raw, pos_raw)
         except requests.RequestException as err:
             raise UpdateFailed(f"PTV API error: {err}") from err
@@ -502,20 +577,8 @@ class PTVDataCoordinator(DataUpdateCoordinator):
             index[key] = by_trip
         return index
 
-    @staticmethod
-    def _service_midnight(start_date: str) -> datetime:
-        """Local midnight of a trip's service day (GTFS times count from it)."""
-        now = datetime.now().astimezone()
-        if start_date and len(start_date) == 8:
-            try:
-                day = datetime.strptime(start_date, "%Y%m%d")
-                return day.replace(tzinfo=now.tzinfo)
-            except ValueError:
-                pass
-        return now.replace(hour=0, minute=0, second=0, microsecond=0)
-
     def _station_hits(self, stus, direction_id, is_express, now_utc,
-                      trip_id="", start_date="", index=None, stats=None):
+                      trip_id="", index=None, stats=None):
         """First future stop at each configured station for one trip.
 
         Returns ({station_key: hit, "skipped", or None}, the trip's worst
@@ -575,7 +638,9 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                 if when is None and sched:
                     # Delay-only update: scheduled time plus the delay.
                     if midnight is None:
-                        midnight = self._service_midnight(start_date)
+                        # Scheduled seconds count from the cache day's
+                        # midnight, after-midnight trains included.
+                        midnight = self._cache_midnight()
                     when = midnight + timedelta(seconds=sched["dep_seconds"] + delay)
                     stats["time_from_delay"] = stats.get("time_from_delay", 0) + 1
                 if when is None:
@@ -661,7 +726,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
             for tline, tdir in targets:
                 hits, trip_max_delay = self._station_hits(
                     stus, tdir, is_express, now_utc,
-                    trip_id=trip_id, start_date=tu.trip.start_date,
+                    trip_id=trip_id,
                     index=index, stats=stats,
                 )
                 for key, hit in hits.items():
@@ -732,14 +797,12 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                         continue
 
                     # Find the cutoff: after the last realtime entry, or now
+                    # Counted from the cache day's midnight, so a last live
+                    # train just past midnight doesn't wrap to 00:xx and pull
+                    # in the morning's (already departed) trains.
                     if existing:
                         last_dt = datetime.fromisoformat(existing[-1]["dt_iso"])
-                        last_sec = (
-                            last_dt.astimezone().hour * 3600
-                            + last_dt.astimezone().minute * 60
-                            + last_dt.astimezone().second
-                        )
-                        after_sec = last_sec
+                        after_sec = int((last_dt - self._cache_midnight()).total_seconds())
                     else:
                         after_sec = now_sec
 

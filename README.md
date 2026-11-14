@@ -249,7 +249,9 @@ See `dashboard_card.yaml` for a Lovelace markdown card showing next trains with 
 
 ## Polling and API usage
 
-The Transport Victoria API allows 24 calls per 60 seconds per feed. The integration reads three feeds (trip updates, service alerts, vehicle positions), so each poll costs 3 API calls. Even the fastest tier is well within the limit.
+The Transport Victoria API allows 20–27 calls a minute per feed, and caches each feed for 30 seconds. The integration reads three feeds (trip updates, service alerts, vehicle positions), so each poll costs 3 API calls, one per feed. Even the fastest tier is well within the limit.
+
+The three are requested at the same time, so a slow poll takes as long as the slowest feed rather than all three added up; that doesn't change the number of calls. Failed requests are never retried within a poll. If a feed answers `429 Too Many Requests`, the integration stops asking that feed for as long as the `Retry-After` header says (90 seconds if it doesn't say, at most 15 minutes) and keeps showing the last copy it got.
 
 Departure times only need to be fresh when you are actually travelling, so polling rate follows the commute:
 
@@ -282,7 +284,7 @@ Use `live_alert_count` for "is something wrong right now", and `alert_count` for
 
 - **Metro Tunnel stations** (Arden, Parkville, State Library, Town Hall, Anzac) work for Sunbury, Pakenham and Cranbourne. Trains run straight through the tunnel, but PTV's timetable splits each one at Town Hall into a trip on each line — so the integration follows each of your line's trains through to the other side. Directions are relative to your line: for a Pakenham rider at Parkville, *citybound* means continuing west towards Sunbury, and *outbound* means heading back to Pakenham.
 - The trip updates feed does **not** include rail replacement buses, platform changes, or route deviations
-- The static timetable is rebuilt on the first poll after midnight, so scheduled departures always come from the current day's services. At the same time the integration asks the Transport Victoria open data portal for the current release (published weekly, and its download link changes over time) and downloads it only when it has changed. Each mode's timetable is kept in `config/ptv_gtfs/` (a few MB), so a new day never needs the full ~240 MB download
+- The static timetable is rebuilt on the first poll after midnight, so scheduled departures always come from the current day's services. Trains after midnight that belong to the previous day's timetable (written as 24:30 and so on) are kept. The rebuild runs in the background: Home Assistant's startup and the polls never wait for it, and startup loads only from disk. At the same time the integration asks the Transport Victoria open data portal for the current release (published weekly, and its download link changes over time) and downloads it only when it has changed. Each mode's timetable is kept in `config/ptv_gtfs/` (a few MB), so a new day never needs the full ~240 MB download
 - If the portal or the download fails, the timetable already on disk stays in use for as long as it covers today. Scheduled times are never taken from a different day's timetable: if no timetable covers today, only realtime departures are shown and it retries hourly
 - A repair issue appears under **Settings → System → Repairs** when the timetable can't be loaded for today, or when no new release has been confirmed for 10 days. It clears itself once an update succeeds. Each departure sensor's `timetable_published` attribute shows the date of the timetable in use
 - Express services are identified from the realtime feed's route ID; the static timetable has no equivalent marker

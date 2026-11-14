@@ -24,6 +24,7 @@ TODAY = datetime.now().astimezone()
 DOW = TODAY.strftime("%A").lower()
 DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 OTHER = DAYS[(DAYS.index(DOW) + 1) % 7]
+YDAY = DAYS[(DAYS.index(DOW) - 1) % 7]
 
 
 def _csv(rows):
@@ -37,7 +38,8 @@ def inner_zip(tag: str, route: str) -> bytes:
     head = ["service_id", "start_date", "end_date"] + DAYS
     cal = [head,
            ["TODAY", start, end] + ["1" if d == DOW else "0" for d in DAYS],
-           ["OTHER", start, end] + ["1" if d == OTHER else "0" for d in DAYS]]
+           ["OTHER", start, end] + ["1" if d == OTHER else "0" for d in DAYS],
+           ["YDAY", start, end] + ["1" if d == YDAY else "0" for d in DAYS]]
     files = {
         "stops.txt": _csv([["stop_id", "stop_name"],
                            ["100", "Ivanhoe Railway Station"],
@@ -47,10 +49,18 @@ def inner_zip(tag: str, route: str) -> bytes:
                             ["aus:vic:vic-02-BEG:", "b"]]),
         "trips.txt": _csv([["route_id", "service_id", "trip_id", "direction_id", "trip_headsign", "block_id"],
                            [route, "TODAY", "t1", "1", "City", ""],
-                           [route, "OTHER", "t2", "1", "City", ""]]),
+                           [route, "OTHER", "t2", "1", "City", ""],
+                           [route, "YDAY", "late_yday", "1", "City", ""],
+                           [route, "TODAY", "late_today", "1", "City", ""]]),
         "stop_times.txt": _csv([["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"],
                                 ["t1", f"08:0{tag}:00", f"08:0{tag}:00", "100", "1"],
-                                ["t2", "07:00:00", "07:00:00", "100", "1"]]),
+                                ["t2", "07:00:00", "07:00:00", "100", "1"],
+                                # Yesterday's service, after midnight: today 00:30
+                                ["late_yday", "24:30:00", "24:30:00", "100", "1"],
+                                # Yesterday's service before midnight: not today
+                                ["late_yday", "23:00:00", "23:00:00", "101", "2"],
+                                # Today's service after midnight: tomorrow 01:00
+                                ["late_today", "25:00:00", "25:00:00", "100", "1"]]),
         "calendar.txt": _csv(cal),
         "calendar_dates.txt": _csv([["service_id", "date", "exception_type"]]),
     }
@@ -138,7 +148,9 @@ def run(tmp_path, stations=("Ivanhoe",)):
 
 
 def deps(cache):
-    return [d["dep_str"] for d in cache["scheduled_by_station"]["ivanhoe"]]
+    """Today's daytime departures (after-midnight ones are tested apart)."""
+    return [d["dep_str"] for d in cache["scheduled_by_station"]["ivanhoe"]
+            if d["trip_id"] not in ("late_yday", "late_today")]
 
 
 def test_first_run_downloads_and_uses_todays_services(tmp_path, portal):
@@ -250,4 +262,42 @@ def _age_cache(tmp_path):
     p = tmp_path / "ptv_gtfs_cache.json"
     c = json.loads(p.read_text())
     c["cached_date"] = "20000101"
+    c["release_checked_date"] = "20000101"
     p.write_text(json.dumps(c))
+
+
+def test_after_midnight_trains_kept(tmp_path, portal):
+    c = run(tmp_path)
+    late = {d["trip_id"]: d for d in c["scheduled_by_station"]["ivanhoe"]
+            if d["trip_id"].startswith("late")}
+    # Yesterday's 24:30 is today's 00:30; its 23:00 stop belongs to yesterday.
+    assert late["late_yday"]["dep_seconds"] == 1800 and late["late_yday"]["previous_day"]
+    assert late["late_today"]["dep_seconds"] == 25 * 3600
+    assert len([d for d in c["scheduled_by_station"]["ivanhoe"]
+                if d["trip_id"] == "late_yday"]) == 1
+
+
+def test_disk_only_makes_no_network_calls(tmp_path, portal):
+    run(tmp_path)                      # puts a timetable on disk
+    _age_cache(tmp_path)
+    portal.calls.clear()
+    c = gs.download_and_cache_gtfs(str(tmp_path), ["Ivanhoe"], ROUTES, "train", False)
+    assert portal.calls == []
+    assert deps(c) == ["08:01:00"]
+    assert c["release_checked_date"] != c["cached_date"]   # still to check today
+
+
+def test_disk_only_with_nothing_on_disk_raises(tmp_path, portal):
+    with pytest.raises(RuntimeError):
+        gs.download_and_cache_gtfs(str(tmp_path), ["Ivanhoe"], ROUTES, "train", False)
+    assert portal.calls == []
+
+
+def test_checked_today_is_not_asked_again(tmp_path, portal):
+    run(tmp_path)
+    portal.api_up = False              # check fails, but it was attempted today
+    _age_cache(tmp_path)
+    run(tmp_path)
+    portal.calls.clear()
+    run(tmp_path)
+    assert portal.calls == []

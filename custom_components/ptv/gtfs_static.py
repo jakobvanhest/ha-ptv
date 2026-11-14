@@ -189,6 +189,9 @@ def _through_trips(z: zipfile.ZipFile, route_ids: set[str], active_sids: set[str
     return {tid: own_blocks[key] for tid, key in candidates if key in own_blocks}
 
 
+DAY_SECONDS = 86400
+
+
 def _load_scheduled_departures(
     metro_z: zipfile.ZipFile,
     stop_ids: set[str],
@@ -196,35 +199,50 @@ def _load_scheduled_departures(
     today_str: str,
     dow: str,
     through_trips: dict[str, str] | None = None,
+    previous_day: tuple[str, str, dict[str, str]] | None = None,
 ) -> list[dict]:
     """Return all departures at stop_ids today, sorted by time.
 
     through_trips (from _through_trips) adds the tunnel continuations of the
     selected lines' trains, with direction flipped to read relative to them.
-    """
-    active_sids = _active_service_ids(metro_z, today_str, dow)
 
-    # Trip -> direction
+    previous_day, as (date, weekday, through_trips), adds the previous
+    service day's trains that run after midnight. GTFS writes those as
+    24:10:00 and so on under the previous day's services, so a cache built
+    for today alone would lose every train between midnight and the first
+    of today's. They are shifted to read from today's midnight.
+    """
+    route_prefixes = tuple(route_ids)
+    days = [(_active_service_ids(metro_z, today_str, dow), through_trips or {}, 0, 0)]
+    if previous_day:
+        p_date, p_dow, p_through = previous_day
+        days.append((_active_service_ids(metro_z, p_date, p_dow), p_through or {},
+                     -DAY_SECONDS, DAY_SECONDS))
+
+    # Trip -> direction, per service day
     # Prefix match so route ID variants (e.g. "aus:vic:vic-02-HBE:E" express)
     # are included; base IDs end with ":" so "-R:" replacement buses never match.
-    route_prefixes = tuple(route_ids)
-    through_trips = through_trips or {}
-    trip_dirs: dict[str, int] = {}
+    day_dirs: list[dict[str, int]] = [{} for _ in days]
     tunnel_trips: set[str] = set()
     with metro_z.open("trips.txt") as f:
         for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
-            if row.get("service_id") not in active_sids:
-                continue
+            sid = row.get("service_id")
             rid = row.get("route_id", "")
             direction = int(row.get("direction_id", 0))
-            if rid.startswith(route_prefixes):
-                trip_dirs[row["trip_id"]] = direction
-            elif row["trip_id"] in through_trips:
-                trip_dirs[row["trip_id"]] = 1 - direction
-            else:
-                continue
-            if any(rid.startswith(t) for t in TUNNEL_SIDES):
+            kept = False
+            for (active, through, _off, _min), dirs in zip(days, day_dirs):
+                if sid not in active:
+                    continue
+                if rid.startswith(route_prefixes):
+                    dirs[row["trip_id"]] = direction
+                elif row["trip_id"] in through:
+                    dirs[row["trip_id"]] = 1 - direction
+                else:
+                    continue
+                kept = True
+            if kept and any(rid.startswith(t) for t in TUNNEL_SIDES):
                 tunnel_trips.add(row["trip_id"])
+    wanted = set().union(*day_dirs)
 
     # Departures at our stops. A tunnel trip's last stop is the Town Hall
     # handover, where the train carries on as the next trip — that row is an
@@ -238,7 +256,7 @@ def _load_scheduled_departures(
                 seq = int(row.get("stop_sequence") or 0)
                 if seq > last_seq.get(tid, -1):
                     last_seq[tid] = seq
-            if row.get("stop_id") in stop_ids and tid in trip_dirs:
+            if row.get("stop_id") in stop_ids and tid in wanted:
                 rows.append(row)
 
     deps = []
@@ -254,16 +272,21 @@ def _load_scheduled_departures(
             dep_sec = int(h)*3600 + int(m)*60 + int(s)
         except ValueError:
             continue
-        deps.append({
-            "dep_seconds": dep_sec,
-            "direction_id": trip_dirs[tid],
-            "trip_id": tid,
-            "stop_id": row["stop_id"],
-            # Lets realtime updates be matched to this stop even when they
-            # name a different platform's stop_id.
-            "stop_sequence": int(row.get("stop_sequence") or 0),
-            "dep_str": dep_str,
-        })
+        for (_a, _t, offset, min_sec), dirs in zip(days, day_dirs):
+            if tid not in dirs or dep_sec < min_sec:
+                continue
+            deps.append({
+                # Seconds from the cache day's midnight; may exceed 86400.
+                "dep_seconds": dep_sec + offset,
+                "direction_id": dirs[tid],
+                "trip_id": tid,
+                "stop_id": row["stop_id"],
+                # Lets realtime updates be matched to this stop even when they
+                # name a different platform's stop_id.
+                "stop_sequence": int(row.get("stop_sequence") or 0),
+                "dep_str": dep_str,
+                "previous_day": offset != 0,
+            })
     deps.sort(key=lambda x: x["dep_seconds"])
     return deps
 
@@ -416,6 +439,7 @@ def download_and_cache_gtfs(
     station_names: list[str],
     route_ids: set[str],
     mode: str = MODE_TRAIN,
+    check_release: bool = True,
 ) -> dict:
     """Return today's timetable cache, downloading a new release if needed.
 
@@ -424,6 +448,10 @@ def download_and_cache_gtfs(
     and rebuilds today's departures from the timetable on disk. Failures
     fall back to the timetable already on disk, which stays correct for
     any date it covers; failing that, to an old cache without departures.
+
+    check_release=False uses only what is on disk, with no network access,
+    so Home Assistant's startup never waits on the portal or a download;
+    the coordinator runs the check in the background afterwards.
     """
     # Train and tram are separate config entries, so they need separate caches.
     cache_name = GTFS_CACHE_FILE if mode == MODE_TRAIN else \
@@ -436,7 +464,7 @@ def download_and_cache_gtfs(
     old = _read_json(cache_path)
     if (old and old.get("schema") == GTFS_CACHE_SCHEMA
             and old.get("cached_date") == today_str
-            and old.get("release_check_ok")
+            and (old.get("release_checked_date") == today_str or not check_release)
             and all(s.lower() in old.get("scheduled_by_station", {}) for s in station_names)):
         _LOGGER.debug("Using today's GTFS cache")
         return old
@@ -447,17 +475,20 @@ def download_and_cache_gtfs(
 
     release: dict | None = None
     check_error = ""
-    try:
-        release = resolve_gtfs_release()
-    except Exception as err:
-        check_error = f"Could not look up the current timetable: {err}"
-        _LOGGER.warning("%s", check_error)
+    if check_release:
+        try:
+            release = resolve_gtfs_release()
+        except Exception as err:
+            check_error = f"Could not look up the current timetable: {err}"
+            _LOGGER.warning("%s", check_error)
 
     download_error = ""
     with _DOWNLOAD_LOCK:
         on_disk = _read_json(release_path) or {}
         have_zip = zip_path.exists() and mode in on_disk.get("modes", [])
-        target = release or (None if have_zip else {"url": GTFS_FALLBACK_URL, "version": ""})
+        target = release or (
+            None if have_zip or not check_release
+            else {"url": GTFS_FALLBACK_URL, "version": ""})
         if target and (not have_zip or target["version"] != on_disk.get("version")):
             try:
                 _download_release(target["url"], config_dir, mode)
@@ -482,6 +513,8 @@ def download_and_cache_gtfs(
 
     error = download_error or check_error
     if not have_zip:
+        if not check_release:
+            raise RuntimeError("No timetable on disk yet")
         if old.get("stops"):
             _LOGGER.warning("No timetable on disk; scheduled departures unavailable")
             return _without_departures(old, error)
@@ -494,7 +527,14 @@ def download_and_cache_gtfs(
 
         dow = now.strftime("%A").lower()
         active_sids = _active_service_ids(metro_z, today_str, dow)
-        through_trips = _through_trips(metro_z, route_ids, active_sids)
+        today_through = _through_trips(metro_z, route_ids, active_sids)
+        yday = now - timedelta(days=1)
+        y_str, y_dow = yday.strftime("%Y%m%d"), yday.strftime("%A").lower()
+        y_through = _through_trips(
+            metro_z, route_ids, _active_service_ids(metro_z, y_str, y_dow))
+        # Realtime trips are looked up in through_trips by trip_id, so
+        # yesterday's after-midnight continuations need to be in it too.
+        through_trips = {**y_through, **today_through}
 
         # Load scheduled departures for each requested station
         scheduled_by_station: dict[str, list] = {}
@@ -509,7 +549,9 @@ def download_and_cache_gtfs(
             if entry:
                 stop_ids = set(entry["stop_ids"])
                 deps = _load_scheduled_departures(
-                    metro_z, stop_ids, route_ids, today_str, dow, through_trips)
+                    metro_z, stop_ids, route_ids, today_str, dow,
+                    today_through,
+                    previous_day=(y_str, y_dow, y_through))
                 scheduled_by_station[key] = deps
                 _LOGGER.info("Loaded %d departures for %s", len(deps), station_name)
             else:
@@ -532,6 +574,9 @@ def download_and_cache_gtfs(
         # Release bookkeeping, for the staleness repair issue.
         "release": on_disk,
         "release_check_ok": release is not None,
+        # The day the portal was last asked (successfully or not); the
+        # coordinator checks in the background when this isn't today.
+        "release_checked_date": today_str if check_release else old.get("release_checked_date", ""),
         "release_checked_at": now_utc if release else old.get("release_checked_at", ""),
         "service_end": service_end,
         "has_service_today": bool(active_sids),
