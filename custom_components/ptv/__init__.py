@@ -5,12 +5,14 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-import requests
+import aiohttp
 from google.transit import gtfs_realtime_pb2
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -46,6 +48,14 @@ OVERNIGHT_MIN_SPAN = timedelta(hours=24)
 OVERNIGHT_PHRASES = ("each night", "every night", "each evening")
 # Trains have finished by this hour, so the nightly window is start -> 4am.
 END_OF_SERVICE_HOUR = 4
+# Per-request limits for the realtime feeds: connect, then the whole read.
+FEED_TIMEOUT = aiohttp.ClientTimeout(total=35, connect=10)
+
+
+class FeedError(Exception):
+    """A realtime feed request failed (network, HTTP status or rate limit)."""
+
+
 # How old a feed may be before a failed request fails the update.
 FEED_MAX_STALE = timedelta(minutes=15)
 # Pause before asking an endpoint again after it answers 429 Too Many
@@ -88,7 +98,7 @@ def update_timetable_issue(hass: HomeAssistant, entry: ConfigEntry, cache: dict,
     background load is under way) an existing issue is left as it is and
     no new one is raised until that load has finished.
     """
-    problem = _timetable_problem(cache, datetime.now().astimezone())
+    problem = _timetable_problem(cache, dt_util.now())
     if problem and pending:
         return
     if not problem:
@@ -110,17 +120,17 @@ def _overnight_window(alert_text: str, start_ts: int, end_ts: int) -> str | None
     """
     if not start_ts or not end_ts:
         return None
-    if (datetime.fromtimestamp(end_ts) - datetime.fromtimestamp(start_ts)) < OVERNIGHT_MIN_SPAN:
+    if timedelta(seconds=end_ts - start_ts) < OVERNIGHT_MIN_SPAN:
         return None
     if not any(p in alert_text.lower() for p in OVERNIGHT_PHRASES):
         return None
-    start = datetime.fromtimestamp(start_ts).astimezone()
+    start = dt_util.as_local(dt_util.utc_from_timestamp(start_ts))
     return start.strftime("%-I:%M%p").lower()
 
 
 def _in_overnight_window(now: datetime, start_ts: int) -> bool:
     """True when `now` falls inside tonight's works window."""
-    start = datetime.fromtimestamp(start_ts).astimezone()
+    start = dt_util.as_local(dt_util.utc_from_timestamp(start_ts))
     start_minutes = start.hour * 60 + start.minute
     now_minutes = now.hour * 60 + now.minute
     return now_minutes >= start_minutes or now_minutes < END_OF_SERVICE_HOUR * 60
@@ -276,6 +286,9 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         self.gtfs_cache = gtfs_cache or {}
         self._gtfs_retry_after: datetime | None = None
         self._timetable_task: asyncio.Task | None = None
+        # Home Assistant's shared HTTP session (connection reuse, its proxy
+        # and SSL settings); the realtime feeds no longer use worker threads.
+        self._session = async_get_clientsession(hass)
         self._rate_limited_until: dict[str, datetime] = {}
         self.polling = {
             CONF_SCAN_INTERVAL: scan_interval,
@@ -298,7 +311,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
     def _interval_for_now(self) -> timedelta:
         """Poll fast during commute peaks, slowly overnight."""
         p = self.polling
-        now = datetime.now().astimezone()
+        now = dt_util.now()
         now_min = now.hour * 60 + now.minute
 
         peak_applies = p[CONF_PEAK_ON_WEEKENDS] or now.weekday() < 5
@@ -320,23 +333,22 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         trains after midnight. Between midnight and the day's refresh the
         cache is still yesterday's, and its times stay correct this way.
         """
-        now = datetime.now().astimezone()
         day = (self.gtfs_cache or {}).get("cached_date", "")
         try:
-            # Midnight is local; build it naively, then let astimezone pick
-            # that date's UTC offset (daylight saving can differ from now's).
-            return datetime.strptime(day, "%Y%m%d").astimezone()
+            # Home Assistant's time zone, with that date's own UTC offset
+            # (daylight saving can differ from today's).
+            return dt_util.start_of_local_day(datetime.strptime(day, "%Y%m%d").date())
         except ValueError:
-            return now.replace(hour=0, minute=0, second=0, microsecond=0)
+            return dt_util.start_of_local_day()
 
     def _secs_since_midnight(self) -> int:
         """Seconds from the cache day's midnight to now."""
-        return int((datetime.now().astimezone() - self._cache_midnight()).total_seconds())
+        return int((dt_util.now() - self._cache_midnight()).total_seconds())
 
     def _secs_to_dt(self, secs: int) -> datetime:
         return self._cache_midnight() + timedelta(seconds=secs)
 
-    def _fetch_feed(self, path: str) -> bytes:
+    async def _async_fetch_feed(self, path: str) -> bytes:
         """Fetch a feed, falling back to its last good copy on a blip.
 
         The PTV API occasionally stalls on a single request. Failing the
@@ -351,20 +363,26 @@ class PTVDataCoordinator(DataUpdateCoordinator):
             if until and now < until:
                 # Don't ask again until PTV said to; asking anyway only
                 # extends the block.
-                raise requests.RequestException(f"rate limited until {until:%H:%M:%S}")
-            resp = requests.get(
-                f"{self.api_base}{path}",
-                headers={API_HEADER_KEY: self.api_key},
-                timeout=(10, 25),
-            )
-            if resp.status_code == 429:
-                self._rate_limited_until[path] = now + self._retry_after(resp)
-                _LOGGER.warning(
-                    "PTV %s answered 429 Too Many Requests; pausing it until %s",
-                    path, self._rate_limited_until[path].astimezone().strftime("%H:%M:%S"),
-                )
-            resp.raise_for_status()
-        except requests.RequestException as err:
+                raise FeedError(f"rate limited until {dt_util.as_local(until):%H:%M:%S}")
+            try:
+                async with self._session.get(
+                    f"{self.api_base}{path}",
+                    headers={API_HEADER_KEY: self.api_key},
+                    timeout=FEED_TIMEOUT,
+                ) as resp:
+                    if resp.status == 429:
+                        self._rate_limited_until[path] = now + self._retry_after(resp)
+                        _LOGGER.warning(
+                            "PTV %s answered 429 Too Many Requests; pausing it until %s",
+                            path,
+                            dt_util.as_local(self._rate_limited_until[path]).strftime("%H:%M:%S"),
+                        )
+                    if resp.status >= 400:
+                        raise FeedError(f"HTTP {resp.status}")
+                    content = await resp.read()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                raise FeedError(str(err) or type(err).__name__) from err
+        except FeedError as err:
             cached = self._last_feeds.get(path)
             if cached and datetime.now(timezone.utc) - cached[1] < FEED_MAX_STALE:
                 if path not in self._stale_feeds:
@@ -378,8 +396,8 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         if path in self._stale_feeds:
             _LOGGER.info("PTV %s recovered", path)
             self._stale_feeds.discard(path)
-        self._last_feeds[path] = (resp.content, datetime.now(timezone.utc))
-        return resp.content
+        self._last_feeds[path] = (content, datetime.now(timezone.utc))
+        return content
 
     @staticmethod
     def _retry_after(resp) -> timedelta:
@@ -398,7 +416,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         as long as the slowest feed rather than all three added together.
         """
         trip, alerts, pos = await asyncio.gather(*(
-            self.hass.async_add_executor_job(self._fetch_feed, path)
+            self._async_fetch_feed(path)
             for path in (API_TRIP_UPDATES_PATH, API_SERVICE_ALERTS_PATH,
                          API_VEHICLE_POSITIONS_PATH)
         ))
@@ -417,7 +435,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
             return
         if self._timetable_task and not self._timetable_task.done():
             return
-        now = datetime.now().astimezone()
+        now = dt_util.now()
         today = now.strftime("%Y%m%d")
         cache = self.gtfs_cache or {}
         if cache.get("cached_date") == today and cache.get("release_checked_date") == today:
@@ -435,7 +453,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         weekday timetable on a Saturday, for instance. Runs as a background
         task (see _schedule_timetable_refresh).
         """
-        now = datetime.now().astimezone()
+        now = dt_util.now()
         routes = routes_for_mode(self.mode)
         names = [s[CONF_STATION_NAME] for s in self.stations_config]
         try:
@@ -480,7 +498,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         try:
             trip_raw, alerts_raw, pos_raw = await self._async_fetch_all_feeds()
             return self._parse_all(trip_raw, alerts_raw, pos_raw)
-        except requests.RequestException as err:
+        except FeedError as err:
             raise UpdateFailed(f"PTV API error: {err}") from err
         except Exception as err:
             raise UpdateFailed(f"Feed parse error: {err}") from err
@@ -877,7 +895,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                 )
                 if window_from:
                     in_window = _in_overnight_window(
-                        datetime.now().astimezone(), p.start
+                        dt_util.now(), p.start
                     )
                     break
 

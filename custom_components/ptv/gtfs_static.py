@@ -35,6 +35,15 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+try:  # Home Assistant's configured time zone when running inside it
+    from homeassistant.util import dt as _dt_util
+
+    def _local_now() -> datetime:
+        return _dt_util.now()
+except ImportError:  # standalone (tests, tools)
+    def _local_now() -> datetime:
+        return datetime.now().astimezone()
+
 # Train and tram entries share one download; serialise them so the second
 # sees the first's result instead of downloading the same release again.
 _DOWNLOAD_LOCK = threading.Lock()
@@ -457,7 +466,7 @@ def download_and_cache_gtfs(
     cache_name = GTFS_CACHE_FILE if mode == MODE_TRAIN else \
         GTFS_CACHE_FILE.replace(".json", f"_{mode}.json")
     cache_path = Path(config_dir) / cache_name
-    now = datetime.now().astimezone()
+    now = _local_now()
     today_str = now.strftime("%Y%m%d")
     now_utc = datetime.now(timezone.utc).isoformat()
 

@@ -8,6 +8,7 @@ import json
 import sys
 import types
 import zipfile
+from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -20,7 +21,7 @@ sys.modules["ptv"] = pkg
 import ptv.gtfs_static as gs  # noqa: E402
 import ptv.const as const  # noqa: E402
 
-TODAY = datetime.now().astimezone()
+TODAY = datetime.now(ZoneInfo("Australia/Melbourne"))
 DOW = TODAY.strftime("%A").lower()
 DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 OTHER = DAYS[(DAYS.index(DOW) + 1) % 7]

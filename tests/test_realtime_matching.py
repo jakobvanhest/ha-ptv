@@ -4,6 +4,7 @@ Covers updates as they may arrive from the PTV feed: no direction_id, a
 delay with no absolute time, a stop_id for a different platform than the
 timetable's, a skipped stop, and a cancelled trip.
 """
+from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 
 import pytest
@@ -15,7 +16,7 @@ from custom_components.ptv import PTVDataCoordinator  # noqa: E402
 from custom_components.ptv.const import DEFAULT_MODE  # noqa: E402
 
 ROUTE = "aus:vic:vic-02-HBE:"
-NOW = datetime.now().astimezone()
+NOW = datetime.now(ZoneInfo("Australia/Melbourne"))
 NOW_SEC = NOW.hour * 3600 + NOW.minute * 60 + NOW.second
 
 pytestmark = pytest.mark.skipif(NOW.hour >= 22, reason="times would cross midnight")

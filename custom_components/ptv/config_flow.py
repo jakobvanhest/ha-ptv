@@ -1,14 +1,16 @@
 """Config flow for PTV."""
 from __future__ import annotations
+import asyncio
 import logging
 from typing import Any
 
-import requests
+import aiohttp
 import voluptuous as vol
 from google.transit import gtfs_realtime_pb2
 
 from homeassistant import config_entries
 from homeassistant.core import callback
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.selector import (
     BooleanSelector,
@@ -48,19 +50,24 @@ DIRECTION_OPTIONS = [
 ]
 
 
-def _validate_api_key(api_key: str) -> str | None:
+async def _async_validate_api_key(hass, api_key: str) -> str | None:
+    """None if the key can read the trip updates feed, else an error key."""
+    session = async_get_clientsession(hass)
     try:
-        resp = requests.get(
+        async with session.get(
             f"{API_BASE_URL}{API_TRIP_UPDATES_PATH}",
-            headers={API_HEADER_KEY: api_key}, timeout=15,
-        )
-        if resp.status_code in (401, 403):
-            return "invalid_auth"
-        resp.raise_for_status()
+            headers={API_HEADER_KEY: api_key},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status in (401, 403):
+                return "invalid_auth"
+            if resp.status >= 400:
+                return "cannot_connect"
+            body = await resp.read()
         feed = gtfs_realtime_pb2.FeedMessage()
-        feed.ParseFromString(resp.content)
+        feed.ParseFromString(body)
         return None
-    except requests.RequestException:
+    except (aiohttp.ClientError, asyncio.TimeoutError):
         return "cannot_connect"
     except Exception:
         return "unknown"
@@ -88,7 +95,7 @@ class PTVTrainDelaysConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             api_key = user_input[CONF_API_KEY].strip()
-            error = await self.hass.async_add_executor_job(_validate_api_key, api_key)
+            error = await _async_validate_api_key(self.hass, api_key)
             if error:
                 errors["base"] = error
             else:

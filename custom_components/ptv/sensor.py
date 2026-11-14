@@ -11,6 +11,7 @@ from homeassistant.const import UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_LINES, CONF_STATIONS, CONF_STATION_NAME,
@@ -152,7 +153,8 @@ def _fmt(iso: str | None, delay_sec: int, is_realtime: bool, is_express: bool = 
     if not iso:
         return "Unknown"
     try:
-        dep = datetime.fromisoformat(iso).astimezone()
+        # Home Assistant's time zone, not the server clock's.
+        dep = dt_util.as_local(datetime.fromisoformat(iso))
         time_str = dep.strftime("%-I:%M %p")
         suffix = " · Express" if is_express else ""
         if delay_sec >= 60:
