@@ -64,6 +64,11 @@ FEED_MAX_STALE = timedelta(minutes=15)
 RATE_LIMIT_BACKOFF = timedelta(seconds=90)
 # Wait between attempts when the daily timetable refresh fails.
 GTFS_REFRESH_RETRY = timedelta(hours=1)
+# How long a train that drops out of the live feed keeps its last live time.
+# PTV's trip updates intermittently leave out trains that are still running,
+# sometimes for several polls in a row; without this the next-train sensors
+# jump between trains and a delayed train can vanish before it departs.
+REALTIME_HOLD = timedelta(minutes=15)
 
 
 def _timetable_problem(cache: dict, now: datetime) -> str:
@@ -290,6 +295,8 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         # and SSL settings); the realtime feeds no longer use worker threads.
         self._session = async_get_clientsession(hass)
         self._rate_limited_until: dict[str, datetime] = {}
+        # (line, station key, direction_id) -> trip_id -> (last live hit, seen at)
+        self._rt_seen: dict[tuple, dict[str, tuple[dict, datetime]]] = {}
         self.polling = {
             CONF_SCAN_INTERVAL: scan_interval,
             CONF_OFFPEAK_INTERVAL: DEFAULT_OFFPEAK_INTERVAL,
@@ -599,8 +606,8 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                       trip_id="", index=None, stats=None):
         """First future stop at each configured station for one trip.
 
-        Returns ({station_key: hit, "skipped", or None}, the trip's worst
-        delay). A hit records the direction to file it under: the
+        Returns ({station_key: hit, "skipped", "departed", or None}, the
+        trip's worst delay). A hit records the direction to file it under: the
         timetable's when it knows the trip, otherwise the feed's.
         """
         index = index or {}
@@ -610,6 +617,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         }
         midnight = None
         trip_max_delay = 0
+        departed: set[str] = set()
         for stu in stus:
             delay = 0
             dep_time = None
@@ -665,6 +673,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                     stats["no_time"] = stats.get("no_time", 0) + 1
                     continue
                 if when <= now_utc:
+                    departed.add(key)
                     continue
                 stats[f"by_{match}"] = stats.get(f"by_{match}", 0) + 1
                 if scheduled and dir_id != direction_id:
@@ -673,6 +682,9 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                     "actual": when, "delay_sec": delay, "is_express": is_express,
                     "dir": dir_id, "trip_id": trip_id,
                 }
+        for key in departed:
+            if hits[key] is None:
+                hits[key] = "departed"
         return hits, trip_max_delay
 
     def _parse_trip_updates(self, raw, route_map, results):
@@ -693,6 +705,11 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         # skipping a given station.
         self._cancelled_trips: set[str] = set()
         self._skipped_at: dict[str, set[str]] = {
+            scfg[CONF_STATION_NAME].lower(): set() for scfg in self.stations_config
+        }
+        # Trips whose live time at a station has already passed: not to be
+        # filled back in from the timetable or held from an earlier poll.
+        self._departed_at: dict[str, set[str]] = {
             scfg[CONF_STATION_NAME].lower(): set() for scfg in self.stations_config
         }
 
@@ -750,6 +767,8 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                 for key, hit in hits.items():
                     if hit == "skipped":
                         self._skipped_at[key].add(trip_id)
+                    elif hit == "departed":
+                        self._departed_at[key].add(trip_id)
                     elif hit:
                         rt_buckets[tline][key][hit["dir"]].append(hit)
 
@@ -766,6 +785,8 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         # How realtime updates were matched, to diagnose stations that never
         # show live times (enable debug logging for custom_components.ptv).
         _LOGGER.debug("Realtime matching: %s", stats or "no trip updates for these lines")
+
+        self._hold_missing_trips(rt_buckets, now_utc)
 
         # Sort and store realtime departures per station/direction
         for line in self.monitored_lines:
@@ -785,6 +806,45 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                         for h in hits[:count]
                     ]
 
+    def _hold_missing_trips(self, rt_buckets, now_utc) -> None:
+        """Keep trains that dropped out of this poll's feed at their last live time.
+
+        A train seen live within REALTIME_HOLD that is missing now, and that
+        the feed hasn't cancelled or marked as skipping the station, is put
+        back with the time it last had, until that time passes. Trains seen
+        in this poll replace what was remembered for them.
+        """
+        seen = getattr(self, "_rt_seen", None)
+        if seen is None:
+            seen = self._rt_seen = {}
+        cancelled = getattr(self, "_cancelled_trips", set())
+        skipped_at = getattr(self, "_skipped_at", {})
+        departed_at = getattr(self, "_departed_at", {})
+        held = 0
+        for line, stations in rt_buckets.items():
+            for key, by_dir in stations.items():
+                for dir_id, hits in by_dir.items():
+                    memory = seen.setdefault((line, key, dir_id), {})
+                    present = {h["trip_id"] for h in hits if h.get("trip_id")}
+                    for trip_id, (hit, seen_at) in list(memory.items()):
+                        gone = (
+                            hit["actual"] <= now_utc
+                            or now_utc - seen_at > REALTIME_HOLD
+                            or trip_id in cancelled
+                            or trip_id in skipped_at.get(key, set())
+                            or trip_id in departed_at.get(key, set())
+                        )
+                        if gone:
+                            del memory[trip_id]
+                        elif trip_id not in present:
+                            hits.append(hit)
+                            held += 1
+                    for h in hits:
+                        if h.get("trip_id") in present:
+                            memory[h["trip_id"]] = (h, now_utc)
+        if held:
+            _LOGGER.debug("Kept %d train(s) missing from this poll at their last live time", held)
+
     # ------------------------------------------------------------------ #
     # Static timetable fallback
     # ------------------------------------------------------------------ #
@@ -795,6 +855,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         now_sec = self._secs_since_midnight()
         cancelled = getattr(self, "_cancelled_trips", set())
         skipped_at = getattr(self, "_skipped_at", {})
+        departed_at = getattr(self, "_departed_at", {})
 
         for line in self.monitored_lines:
             for scfg in self.stations_config:
@@ -810,35 +871,33 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                         continue
 
                     existing = station_data[dir_key]
-                    needed = count - len(existing)
-                    if needed <= 0:
+                    if len(existing) >= count:
                         continue
 
-                    # Find the cutoff: after the last realtime entry, or now
-                    # Counted from the cache day's midnight, so a last live
-                    # train just past midnight doesn't wrap to 00:xx and pull
-                    # in the morning's (already departed) trains.
-                    if existing:
-                        last_dt = datetime.fromisoformat(existing[-1]["dt_iso"])
-                        after_sec = int((last_dt - self._cache_midnight()).total_seconds())
-                    else:
-                        after_sec = now_sec
-
-                    exclude = cancelled | skipped_at.get(key, set()) | {
+                    # Timetabled trains from now on that the live feed didn't
+                    # list. Filling only after the last live train hid any
+                    # train missing from the feed but due before it (a
+                    # delayed train dropping out of the feed vanished). Seconds
+                    # count from the cache day's midnight, so just after
+                    # midnight this doesn't wrap to the morning's trains.
+                    exclude = cancelled | skipped_at.get(key, set()) | \
+                        departed_at.get(key, set()) | {
                         e.get("trip_id") for e in existing if e.get("trip_id")
                     }
                     scheduled = get_next_n_scheduled(
-                        self.gtfs_cache, key, dir_id, after_sec, needed, exclude
+                        self.gtfs_cache, key, dir_id, now_sec, count, exclude
                     )
                     for sched in scheduled:
                         dt = self._secs_to_dt(sched["dep_seconds"])
-                        station_data[dir_key].append({
+                        existing.append({
                             "dt_iso": dt.isoformat(),
                             "delay_sec": 0,
                             "is_realtime": False,
                             "is_express": False,  # not derivable from static schedule
                             "trip_id": sched.get("trip_id", ""),
                         })
+                    existing.sort(key=lambda e: datetime.fromisoformat(e["dt_iso"]))
+                    del existing[count:]
 
     # ------------------------------------------------------------------ #
     # Service alerts
