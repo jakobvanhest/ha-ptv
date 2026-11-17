@@ -64,6 +64,9 @@ FEED_MAX_STALE = timedelta(minutes=15)
 RATE_LIMIT_BACKOFF = timedelta(seconds=90)
 # Wait between attempts when the daily timetable refresh fails.
 GTFS_REFRESH_RETRY = timedelta(hours=1)
+# GTFS-Realtime StopTimeUpdate.schedule_relationship values.
+SR_SKIPPED = 1
+SR_NO_DATA = 2
 # How long a train that drops out of the live feed keeps its last live time.
 # PTV's trip updates intermittently leave out trains that are still running,
 # sometimes for several polls in a row; without this the next-train sensors
@@ -602,88 +605,167 @@ class PTVDataCoordinator(DataUpdateCoordinator):
             index[key] = by_trip
         return index
 
+    @staticmethod
+    def _stop_event(stu):
+        """(time, delay) of a stop time update, either possibly None.
+
+        The departure is used where it carries anything, otherwise the
+        arrival. delay is None when the feed didn't set it, as distinct
+        from a delay of 0.
+        """
+        for name in ("departure", "arrival"):
+            if not stu.HasField(name):
+                continue
+            ev = getattr(stu, name)
+            when = datetime.fromtimestamp(ev.time, tz=timezone.utc) if ev.time else None
+            delay = ev.delay if ev.HasField("delay") else None
+            if when is not None or delay is not None:
+                return when, delay
+        return None, None
+
+    @classmethod
+    def _propagated(cls, earlier):
+        """Delay carried to a stop from the updates before it, per GTFS-RT.
+
+        An update applies to the stops after it up to the next update, so
+        the nearest earlier update decides: NO_DATA there means no live
+        information ("no_data"); a SKIPPED stop is passed over, as the
+        delay carries through it; otherwise its delay. Returns None when
+        there is nothing to carry, including an update with only an
+        absolute time, whose delay would need that stop's timetable.
+        """
+        for stu in reversed(earlier):
+            if stu.schedule_relationship == SR_NO_DATA:
+                return "no_data"
+            if stu.schedule_relationship == SR_SKIPPED:
+                continue
+            _, delay = cls._stop_event(stu)
+            if delay is not None:
+                return delay
+            return None
+        return None
+
     def _station_hits(self, stus, direction_id, is_express, now_utc,
                       trip_id="", index=None, stats=None):
         """First future stop at each configured station for one trip.
 
-        Returns ({station_key: hit, "skipped", "departed", or None}, the
-        trip's worst delay). A hit records the direction to file it under: the
-        timetable's when it knows the trip, otherwise the feed's.
+        Follows the GTFS-Realtime rules for stop time updates: an update
+        listing the station gives its time (a delay with no time is added
+        to the scheduled time; a time with no delay gets its delay from
+        the timetable). An update for an earlier stop carries its delay on
+        to the station when the station isn't listed. NO_DATA means no live
+        information, so the timetable's time is shown instead; SKIPPED
+        means the train doesn't stop there.
+
+        Returns ({station_key: hit, "skipped", "departed", "no_data" or
+        None}, the trip's worst delay). A hit records the direction to file
+        it under: the timetable's when it knows the trip, otherwise the
+        feed's.
         """
         index = index or {}
         stats = stats if stats is not None else {}
         hits: dict[str, dict | str | None] = {
             scfg[CONF_STATION_NAME].lower(): None for scfg in self.stations_config
         }
-        midnight = None
         trip_max_delay = 0
-        departed: set[str] = set()
         for stu in stus:
-            delay = 0
-            dep_time = None
-            if stu.HasField("departure"):
-                delay = stu.departure.delay or 0
-                if stu.departure.time:
-                    dep_time = datetime.fromtimestamp(stu.departure.time, tz=timezone.utc)
-            elif stu.HasField("arrival"):
-                delay = stu.arrival.delay or 0
-                if stu.arrival.time:
-                    dep_time = datetime.fromtimestamp(stu.arrival.time, tz=timezone.utc)
-            trip_max_delay = max(trip_max_delay, delay)
-            for key in hits:
-                if hits[key] is not None:
-                    continue  # already found for this trip
-                scheduled = index.get(key, {}).get(trip_id, [])
-                dir_id = scheduled[0]["direction_id"] if scheduled else direction_id
-                info = self.station_stop_ids.get(key, {})
-                # Use direction-specific stop IDs if available
-                if dir_id == 1:
-                    stop_ids = info.get("citybound_stop_ids", info.get("stop_ids", []))
-                else:
-                    stop_ids = info.get("outbound_stop_ids", info.get("stop_ids", []))
-                match = None
+            _, delay = self._stop_event(stu)
+            trip_max_delay = max(trip_max_delay, delay or 0)
+        midnight = None
+
+        def bump(name):
+            stats[name] = stats.get(name, 0) + 1
+
+        for key in hits:
+            scheduled = index.get(key, {}).get(trip_id, [])
+            dir_id = scheduled[0]["direction_id"] if scheduled else direction_id
+            info = self.station_stop_ids.get(key, {})
+            # Use direction-specific stop IDs if available
+            if dir_id == 1:
+                stop_ids = info.get("citybound_stop_ids", info.get("stop_ids", []))
+            else:
+                stop_ids = info.get("outbound_stop_ids", info.get("stop_ids", []))
+
+            # Where the trip is at this station: (position in stus or None
+            # when not listed, the timetable entry, how it was matched).
+            candidates = []
+            for i, stu in enumerate(stus):
                 if stu.stop_id and stu.stop_id in stop_ids:
-                    match = "stop_id"
                     sched = next((d for d in scheduled if d["stop_id"] == stu.stop_id), None) \
                         or (scheduled[0] if scheduled else None)
-                else:
-                    sched = next(
-                        (d for d in scheduled
-                         if stu.stop_sequence and d.get("stop_sequence") == stu.stop_sequence),
-                        None,
-                    )
+                    candidates.append((i, sched, "stop_id"))
+                elif stu.HasField("stop_sequence"):
+                    sched = next((d for d in scheduled
+                                  if d.get("stop_sequence") == stu.stop_sequence), None)
                     if sched:
-                        match = "stop_sequence"
-                if not match:
-                    continue
-                if stu.schedule_relationship == 1:  # SKIPPED: not stopping here
-                    hits[key] = "skipped"
-                    stats["skipped"] = stats.get("skipped", 0) + 1
-                    continue
-                when = dep_time
-                if when is None and sched:
-                    # Delay-only update: scheduled time plus the delay.
-                    if midnight is None:
-                        # Scheduled seconds count from the cache day's
-                        # midnight, after-midnight trains included.
-                        midnight = self._cache_midnight()
-                    when = midnight + timedelta(seconds=sched["dep_seconds"] + delay)
-                    stats["time_from_delay"] = stats.get("time_from_delay", 0) + 1
+                        candidates.append((i, sched, "stop_sequence"))
+            if not candidates:
+                # Not listed: the stops it inherits a delay from are the
+                # updates before it in the trip's stop order.
+                for sched in sorted(scheduled, key=lambda d: d["dep_seconds"]):
+                    seq = sched.get("stop_sequence")
+                    if seq is None:
+                        continue
+                    earlier = [u for u in stus
+                               if u.HasField("stop_sequence") and u.stop_sequence < seq]
+                    if earlier:
+                        candidates.append((None, sched, "propagated"))
+                        break
+
+            departed = False
+            for pos, sched, match in candidates:
+                if pos is not None:
+                    stu = stus[pos]
+                    if stu.schedule_relationship == SR_SKIPPED:
+                        hits[key] = "skipped"
+                        bump("skipped")
+                        break
+                    if stu.schedule_relationship == SR_NO_DATA:
+                        hits[key] = "no_data"
+                        bump("no_data")
+                        break
+                    when, delay = self._stop_event(stu)
+                    earlier = stus[:pos]
+                else:
+                    when, delay = None, None
+                    earlier = [u for u in stus if u.HasField("stop_sequence")
+                               and u.stop_sequence < sched["stop_sequence"]]
+                if midnight is None:
+                    # Scheduled seconds count from the cache day's midnight,
+                    # after-midnight trains included.
+                    midnight = self._cache_midnight()
+                planned = midnight + timedelta(seconds=sched["dep_seconds"]) if sched else None
+                if when is None and delay is None:
+                    # Nothing for this stop itself: the delay carries on
+                    # from the nearest earlier update.
+                    carried = self._propagated(earlier)
+                    if carried == "no_data":
+                        hits[key] = "no_data"
+                        bump("no_data")
+                        break
+                    delay = carried
+                    if delay is not None:
+                        bump("delay_propagated")
+                if when is None and delay is not None and planned is not None:
+                    when = planned + timedelta(seconds=delay)
+                    bump("time_from_delay")
+                if when is not None and delay is None:
+                    delay = int((when - planned).total_seconds()) if planned is not None else 0
                 if when is None:
-                    stats["no_time"] = stats.get("no_time", 0) + 1
+                    bump("no_time")
                     continue
                 if when <= now_utc:
-                    departed.add(key)
+                    departed = True
                     continue
-                stats[f"by_{match}"] = stats.get(f"by_{match}", 0) + 1
+                bump(f"by_{match}")
                 if scheduled and dir_id != direction_id:
-                    stats["direction_from_timetable"] = stats.get("direction_from_timetable", 0) + 1
+                    bump("direction_from_timetable")
                 hits[key] = {
                     "actual": when, "delay_sec": delay, "is_express": is_express,
                     "dir": dir_id, "trip_id": trip_id,
                 }
-        for key in departed:
-            if hits[key] is None:
+                break
+            if hits[key] is None and departed:
                 hits[key] = "departed"
         return hits, trip_max_delay
 
@@ -710,6 +792,11 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         # Trips whose live time at a station has already passed: not to be
         # filled back in from the timetable or held from an earlier poll.
         self._departed_at: dict[str, set[str]] = {
+            scfg[CONF_STATION_NAME].lower(): set() for scfg in self.stations_config
+        }
+        # Trips the feed marks NO_DATA at a station: shown at their
+        # timetabled time, not held at an earlier live one.
+        self._no_data_at: dict[str, set[str]] = {
             scfg[CONF_STATION_NAME].lower(): set() for scfg in self.stations_config
         }
 
@@ -769,6 +856,8 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                         self._skipped_at[key].add(trip_id)
                     elif hit == "departed":
                         self._departed_at[key].add(trip_id)
+                    elif hit == "no_data":
+                        self._no_data_at[key].add(trip_id)
                     elif hit:
                         rt_buckets[tline][key][hit["dir"]].append(hit)
 
@@ -820,6 +909,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
         cancelled = getattr(self, "_cancelled_trips", set())
         skipped_at = getattr(self, "_skipped_at", {})
         departed_at = getattr(self, "_departed_at", {})
+        no_data_at = getattr(self, "_no_data_at", {})
         held = 0
         for line, stations in rt_buckets.items():
             for key, by_dir in stations.items():
@@ -833,6 +923,7 @@ class PTVDataCoordinator(DataUpdateCoordinator):
                             or trip_id in cancelled
                             or trip_id in skipped_at.get(key, set())
                             or trip_id in departed_at.get(key, set())
+                            or trip_id in no_data_at.get(key, set())
                         )
                         if gone:
                             del memory[trip_id]
